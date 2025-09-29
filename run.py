@@ -41,14 +41,55 @@ def _load_cfg(path: str) -> Dict[str, Any]:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
 
+def _parse_value(s):
+    import json
+    sl = s.strip()
+    # 优先尝试 JSON（支持 true/false/null、数字、列表、对象）
+    try:
+        return json.loads(sl)
+    except Exception:
+        pass
+    # 常见布尔/None
+    if sl.lower() in ("true", "false"):
+        return sl.lower() == "true"
+    if sl.lower() in ("none", "null"):
+        return None
+    # 尝试数字
+    try:
+        if "." in sl:
+            return float(sl)
+        return int(sl)
+    except Exception:
+        return sl  # 回退为字符串
+
+def _set_by_dots(d, key, value):
+    ks = key.split(".")
+    cur = d
+    for k in ks[:-1]:
+        if k not in cur or not isinstance(cur[k], dict):
+            cur[k] = {}
+        cur = cur[k]
+    cur[ks[-1]] = value
+
 
 def main():
     parser = argparse.ArgumentParser(description="nbglm runner")
     parser.add_argument("--config", type=str, default=None, help="YAML 配置文件路径")
+    parser.add_argument("--set", action="append", default=[], help="覆盖配置，点号路径：如 train.epochs=50 或 model.use_cycle=false（可多次）")
+
     args = parser.parse_args()
 
-    cfg_path = args.config or os.environ.get("NBGLM_CONFIG", "config/default.yaml")
+    cfg_path = args.config or os.environ.get("NBGLM_CONFIG", "configs/default.yaml")
     cfg = _load_cfg(cfg_path)
+
+
+    # 应用 --set 覆盖
+    for item in args.set:
+        if "=" not in item:
+            raise ValueError(f"--set 需要 key=value 格式，但得到: {item}")
+        k, v = item.split("=", 1)
+        _set_by_dots(cfg, k.strip(), _parse_value(v))
+
 
     # 输出目录与日志
     run_dirs = data_io.make_run_dirs(
