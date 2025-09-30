@@ -21,6 +21,7 @@ import os
 import argparse
 import json
 from typing import Dict, Any
+import anndata
 
 try:
     import yaml
@@ -30,6 +31,10 @@ except Exception:
 
 from src.nbglm import data_io, pipelines, utils
 
+def anndata_to_dict(obj):
+    if isinstance(obj, anndata.AnnData):
+        return obj.to_dict()  # Convert AnnData to a dictionary or another serializable format
+    raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
 
 def _load_cfg(path: str) -> Dict[str, Any]:
     if not os.path.exists(path):
@@ -118,7 +123,7 @@ def main():
     else:
         raise ValueError(f"[run] 未知 pipeline.mode: {mode}")
 
-    logger.info(f"Done. Summary: {json.dumps(out, ensure_ascii=False, indent=2)}")
+    logger.info(f"Done. Summary: {json.dumps(out, ensure_ascii=False, indent=2, default=anndata_to_dict)}")
 
 
 if __name__ == "__main__":

@@ -65,5 +65,5 @@ evaluate:
 
 pipeline:
   mode: "train_sample_eval"      # ["train_sample_eval","train_sample","sample_eval","sample","evaluate_only"]
-  persist_intermediate: false     # true: 保存 ckpt/pred 文件；false: 采样→评估内存直连
+  persist_intermediate: true     # true: 保存 ckpt/pred 文件；false: 采样→评估内存直连
   # pretrained_ckpt: "./outputs/xxx/ckpt/model.pt"  # 当 mode=sample 或 sample_eval 时从该权重采样

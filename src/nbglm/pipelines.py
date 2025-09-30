@@ -113,13 +113,9 @@ def _build_training_dataloader(cfg: dict, adata_all: ad.AnnData, adata_pert: ad.
     sf_pert, _ = dset.compute_size_factors(X_pert, ref_depth)
 
     # mu_control & theta
-    if use_sf:
-        X_ctrl_norm = X_ctrl / sf_ctrl.unsqueeze(1)
-        mu_control = X_ctrl_norm.mean(dim=0)
-        theta_vec = dset.estimate_theta_per_gene(X_ctrl_norm)
-    else:
-        mu_control = X_ctrl.mean(dim=0)
-        theta_vec = dset.estimate_theta_per_gene(X_ctrl)
+
+    mu_control = X_ctrl.mean(dim=0)
+    theta_vec = dset.estimate_theta_per_gene(X_ctrl)
 
     # phase
     use_cycle = bool(cfg.get("model", {}).get("use_cycle", False))

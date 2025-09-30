@@ -674,13 +674,13 @@ def main():
     sf_pert, _ = compute_size_factors(X_pert_train, ref_depth)
 
     # mu_control & theta：若使用 sf，则先标准化到参考深度再估计；否则直接估计
-    if args.use_sf:
-        X_ctrl_norm = X_ctrl_all / sf_ctrl.unsqueeze(1)
-        mu_control = X_ctrl_norm.mean(dim=0)
-        theta_vector = estimate_theta_per_gene(X_ctrl_norm)
-    else:
-        mu_control = X_ctrl_all.mean(dim=0)
-        theta_vector = estimate_theta_per_gene(X_ctrl_all)
+    # if args.use_sf:
+    #     X_ctrl_norm = X_ctrl_all / sf_ctrl.unsqueeze(1)
+    #     mu_control = X_ctrl_norm.mean(dim=0)
+    #     theta_vector = estimate_theta_per_gene(X_ctrl_norm)
+    # else:
+    mu_control = X_ctrl_all.mean(dim=0)
+    theta_vector = estimate_theta_per_gene(X_ctrl_all)
 
     # 训练用的扰动 id
     pert_names_train = adata_pert.obs[PERT_NAME].tolist()

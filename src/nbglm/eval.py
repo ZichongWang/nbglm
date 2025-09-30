@@ -119,11 +119,20 @@ def _mean_profiles(adata: ad.AnnData, pert_col: str, control_name: str, genes: O
 # -----------------------------
 # 指标：MAE / PDS
 # -----------------------------
+# def mae_score(pred_profiles: pd.DataFrame, true_profiles: pd.DataFrame, pert_list: List[str]) -> float:
+#     vals = []
+#     for p in pert_list:
+#         if p in pred_profiles.index and p in true_profiles.index:
+#             vals.append(np.mean(np.abs(pred_profiles.loc[p].values - true_profiles.loc[p].values)))
+#     return float(np.mean(vals)) if vals else 0.0
 def mae_score(pred_profiles: pd.DataFrame, true_profiles: pd.DataFrame, pert_list: List[str]) -> float:
     vals = []
     for p in pert_list:
         if p in pred_profiles.index and p in true_profiles.index:
-            vals.append(np.mean(np.abs(pred_profiles.loc[p].values - true_profiles.loc[p].values)))
+            # 关键：按列名对齐
+            a = pred_profiles.loc[p]
+            b = true_profiles.loc[p].reindex(a.index)  # 以 a 的列顺序对齐
+            vals.append(float(np.abs(a - b).mean()))
     return float(np.mean(vals)) if vals else 0.0
 
 
@@ -136,6 +145,11 @@ def pds_score(pred_profiles: pd.DataFrame, true_profiles: pd.DataFrame, pert_lis
     pred_pert = pred_profiles.loc[pert_list]
     true_pert = true_profiles.loc[pert_list]
     dist = cdist(pred_pert.values, true_pert.values, metric="cityblock")
+    for i, p_gene in enumerate(pert_list):
+        if p_gene in pred_pert.columns and p_gene in true_pert.columns:
+            correction_vector = np.abs(pred_pert[p_gene].loc[p_gene] - true_pert[p_gene].values)
+            # shape: (n_perts, ); 减到 dist 的第 i 行
+            dist[i, :] -= correction_vector
     dist_df = pd.DataFrame(dist, index=pert_list, columns=pert_list)
     scores = []
     for p in pert_list:
@@ -350,6 +364,21 @@ def evaluate(
             cache_dir=run_dir,
         )
         print(f"[eval] DES: {out['DES']:.6f}")
+
+    # 综合得分
+    if all(k in out for k in ("DES", "PDS", "MAE")):
+        des_baseline = 0.106
+        pds_baseline = 0.516
+        mae_baseline = 0.027
+        overall = (out["DES"] - des_baseline) / (1 - des_baseline) + (out["PDS"] - pds_baseline) / (1 - pds_baseline) + ((mae_baseline - out["MAE"]) / mae_baseline).clip(0, 1)
+        overall *= 100 / 3
+        out["Overall"] = overall
+        print(f"[eval] 综合得分 (基于 DES, PDS and MAE): {out['Overall']:.6f}")
+
+        overall_1 = (out["DES"] - des_baseline) / (1 - des_baseline) + (out["PDS"] - pds_baseline) / (1 - pds_baseline)
+        overall_1 *= 100 / 3
+        out["Overall_wo_MAE"] = overall_1
+        print(f"[eval] 综合得分 (仅基于 DES and PDS): {out['Overall_wo_MAE']:.6f}")
 
     # 保存
     if save_json and run_dir is not None:

@@ -423,12 +423,19 @@ class LowRankNB_GLM(nn.Module):
 
             if sampler == "poisson":
                 sampled = torch.distributions.Poisson(mu_obs).sample()
+            elif sampler == "nb":
+                probs_batch = (mu_obs / (mu_obs + self.theta.unsqueeze(0)))
+                nb_dist = torch.distributions.NegativeBinomial(total_count=self.theta.unsqueeze(0), probs=probs_batch)
+                sampled = nb_dist.sample()
+            elif sampler == "gp_mixture":
+                theta_b = self.theta.unsqueeze(0)
+                mu = mu_obs
+                rate = (theta_b / mu)
+                lam = torch.distributions.Gamma(concentration=theta_b, rate=rate).sample()
+                pois = torch.distributions.Poisson(lam)
+                sampled = pois.sample()
             else:
-                theta_b = self.theta.unsqueeze(0)          # [1, n_g]
-                logits = torch.log(theta_b) - torch.log(mu_obs)  # logit(p) = log(θ) - log(μ)
-                logits = logits.clamp(min=-40.0, max=40.0)       # 数值稳定
-                nb = torch.distributions.NegativeBinomial(total_count=theta_b, logits=logits)
-                sampled = nb.sample()
+                raise ValueError(f"[predict_and_sample] 未知 sampler: {sampler}")
 
             outs.append(sampled.cpu())
 

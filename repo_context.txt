@@ -1,0 +1,3744 @@
+Project Directory Structure:
+nbglm/
+    export_repo.py
+    .gitignore
+    NB_GLM_sf_cycle_loss.py
+    README.md
+    run.py
+    outputs/
+        baseline_nbglm__20250930_020827/
+            config.yaml
+            metrics/
+                metrics.json
+                true_de_cache.pkl
+            ckpt/
+            preds/
+            logs/
+                run.log
+        baseline_nbglm__20250930_021716/
+            config.yaml
+            metrics/
+                metrics.json
+                true_de_cache.pkl
+            ckpt/
+                model.pt
+            preds/
+                pred.h5ad
+            logs/
+                run.log
+        baseline_nbglm__20250929_151240/
+            config.yaml
+            metrics/
+            ckpt/
+            preds/
+            logs/
+                run.log
+        baseline_nbglm__20250929_150919/
+            config.yaml
+            metrics/
+            ckpt/
+            preds/
+            logs/
+                run.log
+    data/
+        perturbation_embedding_P_512D_cpu.csv
+        adata_pp.h5ad
+        PCA_gene_embedding_512D.csv
+    configs/
+        default.yaml
+    src/
+        nbglm/
+            utils.py
+            model.py
+            dataset.py
+            pipelines.py
+            eval.py
+            _init_.py
+            data_io.py
+
+
+================================================================================
+
+--- FILE: export_repo.py ---
+```
+import os
+
+# --- Configuration ---
+# Add file extensions you want to include
+INCLUDE_EXTENSIONS = {'.py', '.js', '.html', '.css', '.md', '.json', '.ts', '.tsx', '.jsx', '.toml', '.yaml','.ipynb'}
+
+# Add directories you want to exclude
+EXCLUDE_DIRS = {'node_modules', '.git', '__pycache__', 'dist', 'build', '.vscode'}
+# Output file name
+OUTPUT_FILE = 'repo_context.txt'
+# --- End Configuration ---
+
+def get_repo_contents(root_dir):
+    """Walks through the repo and concatenates the content of specified files."""
+    repo_contents = ""
+    
+    # First, get the directory structure
+    repo_contents += "Project Directory Structure:\n"
+    for root, dirs, files in os.walk(root_dir):
+        # Exclude specified directories
+        dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+        
+        level = root.replace(root_dir, '').count(os.sep)
+        indent = ' ' * 4 * level
+        repo_contents += f"{indent}{os.path.basename(root)}/\n"
+        sub_indent = ' ' * 4 * (level + 1)
+        for f in files:
+            repo_contents += f"{sub_indent}{f}\n"
+    
+    repo_contents += "\n\n" + "="*80 + "\n\n"
+
+    # Then, get the file contents
+    for root, dirs, files in os.walk(root_dir):
+        # Exclude specified directories
+        dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+        
+        for file in files:
+            if any(file.endswith(ext) for ext in INCLUDE_EXTENSIONS):
+                file_path = os.path.join(root, file)
+                relative_path = os.path.relpath(file_path, root_dir)
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                        repo_contents += f"--- FILE: {relative_path} ---\n"
+                        repo_contents += f"```\n{content}\n```\n\n"
+                except Exception as e:
+                    repo_contents += f"--- FILE: {relative_path} (Error reading) ---\n"
+                    repo_contents += f"Could not read file: {e}\n\n"
+    return repo_contents
+
+if __name__ == "__main__":
+    repo_path = os.getcwd()
+    full_context = get_repo_contents(repo_path)
+    with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
+        f.write(full_context)
+    print(f"Repository context has been written to {OUTPUT_FILE}")
+```
+
+--- FILE: NB_GLM_sf_cycle_loss.py ---
+```
+###############################
+'''
+Comparing to v1, this version use flexible theta per gene
+加上细胞周期，用了更多种类的loss
+Modifications:
+- CPU-friendly fit_concise (build pseudo-bulk on CPU; only KxG on GPU)
+- --use_sf toggle for size factor (train + sampling)
+- Cell cycle covariate (--use_cycle) with G1 baseline; S & G2M learned per-gene effects
+- --phase_strategy {ignore, global, control, fixed_G1, fixed_S, fixed_G2M}
+- Extended losses: POIS_DEV, NB_DEV, MSE_LOG1P, MSE_ANS
+- NB sampler uses logits parameterization (stable & mean-correct)
+
+基线（只用 size factor、不用周期，MSE）：
+python NB_GLM_cycle.py --fit concise --use_sf --loss MSE
+
+用周期 + Poisson deviance：
+python NB_GLM_cycle.py --fit concise --use_sf --use_cycle --loss POIS_DEV --phase_strategy global
+
+用周期 + log1p-MSE（预测固定为 S 期）：
+python NB_GLM_cycle.py --fit concise --use_sf --use_cycle --loss MSE_LOG1P --phase_strategy fixed_S
+
+不用 size factor、不用周期 + NB deviance：
+python NB_GLM_cycle.py --fit concise --loss NB_DEV
+'''
+###############################
+
+import os # 指定使用的GPU设备编号
+import subprocess
+import argparse
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import pandas as pd
+import scanpy as sc
+import anndata as ad
+from tqdm import tqdm
+import time
+import warnings
+from torch.utils.data import Dataset, TensorDataset, DataLoader
+# 忽略anndata可能发出的性能警告
+warnings.filterwarnings('ignore', category=FutureWarning, module='anndata')
+
+# ------------------ 辅助工具 ------------------
+PHASE2ID = {"G1": 0, "S": 1, "G2M": 2}
+
+def to_tensor(X):
+    if hasattr(X, "toarray"):
+        X = X.toarray()
+    return torch.tensor(X, dtype=torch.float32)
+
+def compute_size_factors(X: torch.Tensor, ref_depth: torch.Tensor | None = None, eps: float = 1e-8):
+    lib = X.sum(dim=1)
+    if ref_depth is None:
+        ref_depth = torch.median(lib)
+    sf = (lib / (ref_depth + eps)).clamp(min=eps)
+    return sf, ref_depth
+
+def build_validation_size_factors(df_val: pd.DataFrame,
+                                  sf_ctrl: torch.Tensor,
+                                  ref_depth: torch.Tensor,
+                                  seed: int = 2025) -> torch.Tensor:
+    """按 df_val 顺序生成测试细胞的 size factor；每个扰动从 control sf 重采样并缩放到 median_umi/ref_depth 的中位数。"""
+    import numpy as np
+    rng = np.random.default_rng(seed)
+    sfc = sf_ctrl.detach().cpu().numpy()
+    out = []
+    for _, row in df_val.iterrows():
+        n = int(row["n_cells"])
+        med_umi = float(row["median_umi_per_cell"])
+        target_med_sf = med_umi / float(ref_depth.item())
+        idx = rng.integers(0, len(sfc), size=n)
+        samp = sfc[idx]
+        cur_med = np.median(samp) if np.median(samp) > 0 else 1.0
+        scaled = samp * (target_med_sf / cur_med)
+        out.append(torch.tensor(scaled, dtype=torch.float32))
+    return torch.cat(out, dim=0)
+
+def estimate_theta_per_gene(X_ctrl: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    最简单 MoM：theta = mu^2 / (var - mu)；若 var<=mu 视为近似 Poisson，置大值。
+    注意：若 --use_sf，则 main() 会先把 X_ctrl 做了 size-factor 标准化，再丢到此函数。
+    """
+    print("开始为每个基因估计离散度参数 theta...")
+    mu_g = X_ctrl.mean(dim=0)
+    var_g = X_ctrl.var(dim=0, unbiased=False)
+    denominator = var_g - mu_g
+    theta_g = torch.full_like(mu_g, 1e6)  # 大值近似 Poisson
+    overdispersed_mask = denominator > eps
+    theta_g[overdispersed_mask] = (
+        torch.square(mu_g[overdispersed_mask]) / denominator[overdispersed_mask]
+    )
+    theta_g = theta_g.clamp(min=1e-6, max=1e12)
+    print("Theta 估计完成！")
+    return theta_g
+
+# --------- cell cycle 工具：训练/预测阶段的 phase 处理 ----------
+def phases_to_ids(phases: list[str]) -> torch.LongTensor:
+    return torch.tensor([PHASE2ID.get(p, 0) for p in phases], dtype=torch.long)
+
+def compute_global_phase_probs(phases: list[str]) -> np.ndarray:
+    """返回 [p(G1), p(S), p(G2M)]"""
+    counts = np.zeros(3, dtype=float)
+    for p in phases:
+        if p in PHASE2ID:
+            counts[PHASE2ID[p]] += 1
+    total = counts.sum()
+    if total <= 0:  # fallback: assume mostly G1
+        return np.array([0.7, 0.15, 0.15], dtype=float)
+    return counts / total
+
+def compute_per_pert_phase_probs(adata_pert, pert_name_col: str) -> dict[str, np.ndarray]:
+    """按扰动统计 phase 概率，返回 {pert_name: [pG1,pS,pG2M]}"""
+    df = adata_pert.obs[[pert_name_col, "phase"]].copy()
+    out = {}
+    for name, sub in df.groupby(pert_name_col):
+        out[name] = compute_global_phase_probs(sub["phase"].tolist())
+    return out
+
+def sample_validation_phases(df_val: pd.DataFrame,
+                             phase_strategy: str,
+                             global_probs: np.ndarray,
+                             per_pert_probs: dict[str, np.ndarray] | None,
+                             seed: int = 2025) -> list[int]:
+    """
+    根据策略为验证集每个待生成细胞采样/指定 phase，返回 phase_id 列表（与 df_val 展开顺序一致）。
+    策略：
+      - ignore: 全设为 G1（基线）
+      - global: 按全局比例采样
+      - control: 按训练集中对应扰动的比例采样，若未知则退化为 global
+      - fixed_G1 / fixed_S / fixed_G2M
+    """
+    rng = np.random.default_rng(seed)
+    out = []
+    for _, row in df_val.iterrows():
+        pert = str(row["target_gene"])
+        n = int(row["n_cells"])
+        if phase_strategy == "ignore" or phase_strategy == "fixed_G1":
+            out.extend([PHASE2ID["G1"]]*n)
+        elif phase_strategy == "fixed_S":
+            out.extend([PHASE2ID["S"]]*n)
+        elif phase_strategy == "fixed_G2M":
+            out.extend([PHASE2ID["G2M"]]*n)
+        elif phase_strategy == "global":
+            out.extend(rng.choice([0,1,2], size=n, p=global_probs).tolist())
+        elif phase_strategy == "control":
+            probs = global_probs
+            if per_pert_probs is not None and pert in per_pert_probs:
+                probs = per_pert_probs[pert]
+            out.extend(rng.choice([0,1,2], size=n, p=probs).tolist())
+        else:
+            # 默认退化为 global
+            out.extend(rng.choice([0,1,2], size=n, p=global_probs).tolist())
+    return out
+
+# ===================================================================
+# 新增：Dataset 与 Pseudo-bulk 构建（放在 fit 外部）
+# ===================================================================
+
+class WholeCellDataset(Dataset):
+    """
+    """
+    def __init__(self,
+                 X_tensor: torch.Tensor,            # [N, G] CPU
+                 pert_ids: torch.LongTensor,        # [N]    CPU
+                 sf: torch.Tensor | None = None,    # [N]    CPU
+                 use_sf: bool = True,
+                 use_cycle: bool = False,
+                 phase_ids: torch.LongTensor | None = None):
+        assert X_tensor.device.type == "cpu"
+        assert pert_ids.device.type == "cpu"
+        self.Y = X_tensor  # 原始计数，不在 Dataset 内做 sf 归一
+
+        if use_sf:
+            assert sf is not None and sf.device.type == "cpu"
+            self.log_s = torch.log(sf.clamp_min(1e-12))
+        else:
+            self.log_s = torch.zeros(X_tensor.size(0), dtype=torch.float32)
+        
+        self.pert_ids = pert_ids
+        self.use_cycle = use_cycle
+        if use_cycle:
+            assert phase_ids is not None and phase_ids.device.type == "cpu"
+        self.phase_ids = phase_ids
+
+    def __len__(self):
+        return self.Y.shape[0]
+
+    def __getitem__(self, idx):
+        item = {
+            'y': self.Y[idx],
+            'pert': self.pert_ids[idx]
+        }
+        item['log_s'] = self.log_s[idx]
+        if self.use_cycle:
+            item['phase'] = self.phase_ids[idx]
+        return item
+
+
+class PseudoBulkDataset(Dataset):
+    """
+    聚合后的 pseudo-bulk 数据集：
+      - 不使用周期：每个样本是一个扰动的平均 [G]
+      - 使用周期：每个样本是 (扰动×phase) 的平均 [G]
+    __getitem__ 返回一个 dict：{'y': [G], 'pert': [], 'phase': [] (可选)}
+    """
+    def __init__(self,
+                 Y_avg: torch.Tensor,                       # [K, G] 或 [B_eff, G] CPU
+                 pert_ids_eff: torch.LongTensor,            # [K] 或 [B_eff]
+                 use_cycle: bool = False,
+                 phase_ids_eff: torch.LongTensor | None = None,
+                 log_s_eff: torch.Tensor | None = None):  # [K] 或 [B_eff]，若不使用 size factor 则传 None
+        assert Y_avg.device.type == "cpu"
+        assert pert_ids_eff.device.type == "cpu"
+        self.Y = Y_avg
+        self.pert_ids_eff = pert_ids_eff
+        self.use_cycle = use_cycle
+        if use_cycle:
+            assert phase_ids_eff is not None and phase_ids_eff.device.type == "cpu"
+        self.phase_ids_eff = phase_ids_eff
+        self.log_s = log_s_eff if log_s_eff is not None else torch.zeros(Y_avg.size(0), dtype=torch.float32)
+
+    def __len__(self):
+        return self.Y.shape[0]
+
+    def __getitem__(self, idx):
+        item = {
+            'y': self.Y[idx],
+            'pert': self.pert_ids_eff[idx]
+        }
+        if self.use_cycle:
+            item['phase'] = self.phase_ids_eff[idx]
+        item['log_s'] = self.log_s[idx]
+        return item
+
+
+@torch.no_grad()
+def build_pseudobulk(X_pert_train: torch.Tensor,          # [N, G] CPU
+                     pert_ids_train: torch.LongTensor,    # [N]    CPU
+                     sf_pert: torch.Tensor | None,        # [N]    CPU，若不使用 size factor 则传 None。 仅为接口兼容，实际未使用
+                     ref_depth,
+                     use_sf: bool,
+                     use_cycle: bool,
+                     phase_ids_train: torch.LongTensor | None,  # [N] CPU，当 use_cycle=True 必须提供
+                     batch_size: int = 4096):
+    """
+    在 CPU 上构建 pseudo-bulk（原先 fit_concise 内的逻辑移至此处）：
+      - 若 use_cycle=False：返回 (Y_avg[K,G], unique_perts[K], None)
+      - 若 use_cycle=True ：返回 (Y_avg_flat[B_eff,G], pert_ids_eff[B_eff], phase_ids_eff[B_eff])
+    """
+    lib_all = X_pert_train.sum(dim=1)  # [N] 每个细胞的 UMI（原始库大小）
+    assert X_pert_train.device.type == "cpu"
+    assert pert_ids_train.device.type == "cpu"
+    if use_cycle:
+        assert phase_ids_train is not None and phase_ids_train.device.type == "cpu"
+
+    N, G = X_pert_train.shape
+    unique_perts, inverse_indices = torch.unique(pert_ids_train, return_inverse=True)  # [K], [N]
+    K = unique_perts.numel()
+
+    if not use_cycle:
+        Y_sum = torch.zeros(K, G, dtype=torch.float32)    # CPU
+        counts = torch.zeros(K, dtype=torch.long)         # CPU
+        lib_sum = torch.zeros(K, dtype=torch.float32)  # CPU
+        for start in tqdm(range(0, N, batch_size), desc="构建 pseudo-bulk (CPU)"):
+            end = min(start + batch_size, N)
+            Xb = X_pert_train[start:end]                  # [B,G]
+            invb = inverse_indices[start:end]             # [B]
+            libb = lib_all[start:end].to(torch.float32)
+
+            Y_sum.index_add_(0, invb, Xb)
+            lib_sum.index_add_(0, invb, libb)
+            counts.index_add_(0, invb, torch.ones_like(invb, dtype=torch.long))
+        counts = counts.clamp_min(1)
+        Y_avg = Y_sum / counts.unsqueeze(1)               # [K,G]
+        if use_sf:
+            mean_lib = lib_sum / counts.clamp_min(1).to(torch.float32)     # [K]
+            s_eff = (mean_lib / ref_depth).clamp_min(1e-12)                # [K]
+            log_s_eff = torch.log(s_eff)
+        else:
+            log_s_eff = None
+
+        return Y_avg, unique_perts, None, log_s_eff
+    else:
+        Y_sum = torch.zeros(K, 3, G, dtype=torch.float32) # CPU
+        lib_sum = torch.zeros(K, 3, dtype=torch.float32)  # CPU
+        counts = torch.zeros(K, 3, dtype=torch.long)      # CPU
+        for start in tqdm(range(0, N, batch_size), desc="构建 pseudo-bulk by phase (CPU)"):
+            end = min(start + batch_size, N)
+            Xb  = X_pert_train[start:end]                 # [B,G]
+            invb = inverse_indices[start:end]             # [B]
+            phb  = phase_ids_train[start:end]             # [B]
+            libb = lib_all[start:end].to(torch.float32)
+
+            for phase_id in (0, 1, 2):
+                mask = (phb == phase_id)
+                if mask.any():
+                    idxp = invb[mask]
+                    Xsub = Xb[mask]
+                    lsub = libb[mask]
+                    Y_sum_phase = Y_sum[:, phase_id, :]   # [K,G]
+                    Y_sum_phase.index_add_(0, idxp, Xsub)
+                    lib_sum[:, phase_id].index_add_(0, idxp, lsub)
+                    counts_phase = counts[:, phase_id]    # [K]
+                    counts_phase.index_add_(0, idxp, torch.ones_like(idxp, dtype=torch.long))
+        counts = counts.clamp_min(1)
+        Y_avg = Y_sum / counts.unsqueeze(2)               # [K,3,G]
+
+        # 保留非空并摊平
+        mask_flat = (counts > 0).reshape(-1)              # [K*3]
+        Y_flat    = Y_avg.reshape(K * 3, G)               # [K*3,G]
+        sel_idx   = torch.nonzero(mask_flat, as_tuple=False).squeeze(1)
+        lib_flat = lib_sum.reshape(K*3)                     # [K*3]
+        Y_avg_flat = Y_flat.index_select(0, sel_idx)      # [B_eff,G]
+
+        ks  = torch.arange(K, dtype=torch.long).unsqueeze(1).repeat(1, 3).reshape(-1)
+        phs = torch.tensor([0,1,2], dtype=torch.long).repeat(K)
+        pert_ids_eff  = ks.index_select(0, sel_idx)       # [B_eff]（相对 unique_perts 的索引）
+        phase_ids_eff = phs.index_select(0, sel_idx)      # [B_eff]
+        if use_sf:
+            mean_lib_flat = (lib_flat / counts.reshape(-1).clamp_min(1).to(torch.float32)).index_select(0, sel_idx)  # [B_eff]
+            s_eff_flat = (mean_lib_flat / ref_depth).clamp_min(1e-12)
+            log_s_eff = torch.log(s_eff_flat)                        # [B_eff]
+        else:
+            log_s_eff = None
+        return Y_avg_flat, unique_perts[pert_ids_eff], phase_ids_eff, log_s_eff
+
+# ===================================================================
+# 1. 模型定义: LowRankNB_GLM（加入 cell cycle 固定效应）
+# ===================================================================
+class LowRankNB_GLM(nn.Module):
+    def __init__(self, 
+                 gene_emb: torch.Tensor, 
+                 pert_emb: torch.Tensor,
+                 mu_control: torch.Tensor,
+                 theta_per_gene: torch.Tensor,
+                 use_cycle: bool = False):
+        """
+        初始化模型。
+        - 若 use_cycle=True：在 log-mean 中加入周期固定效应（G1 基线；学习 S & G2M 的 per-gene 系数）
+        """
+        super().__init__()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"模型将在 {self.device} 上运行。")
+
+        # --- 固定的先验和参数 ---
+        self.G = gene_emb.to(self.device)
+        self.P = pert_emb.to(self.device)
+        self.mu_control = (mu_control + 1e-8).to(self.device)
+        self.theta = theta_per_gene.to(self.device)
+        self.use_cycle = use_cycle
+
+        # --- 需要学习的模型参数（与原始结构一致） ---
+        gene_emb_dim = self.G.shape[1]
+        pert_emb_dim = self.P.shape[1]
+        n_genes = self.G.shape[0]
+        self.K = nn.Parameter(torch.empty(gene_emb_dim, pert_emb_dim, device=self.device))
+        self.bias = nn.Parameter(torch.empty(n_genes, device=self.device))
+        self.delta_log_mu_scaler = nn.Parameter(torch.tensor(5.0, device=self.device))
+
+        # 周期固定效应：两个通道（S, G2M），G1 为基线
+        if self.use_cycle:
+            self.beta_cycle = nn.Parameter(torch.zeros(n_genes, 2, device=self.device))
+        else:
+            self.beta_cycle = None
+
+        nn.init.xavier_uniform_(self.K)
+        nn.init.zeros_(self.bias)
+        
+    def forward(self, pert_ids: torch.LongTensor, phase_ids: torch.LongTensor | None = None, offset_log_s: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        前向：输出参考深度下的均值 mu_ref。
+        log mu_ref = log mu_control + Delta_pert + [cycle effects]
+        - phase_ids: LongTensor in {0:G1, 1:S, 2:G2M}; 若 None 或 use_cycle=False，则不加周期项（等价 G1）。
+        """
+        P_selected = self.P[pert_ids]                                   # [B, d_p]
+        raw_output = (self.G @ self.K @ P_selected.T).T + self.bias.unsqueeze(0)  # [B, G]
+        activated_output = torch.tanh(raw_output)
+        delta_log_mu = self.delta_log_mu_scaler * activated_output       # [B, G]
+
+        # 周期固定效应（G1 基线；S、G2M 两个系数）
+        if self.use_cycle and phase_ids is not None:
+            # one-hot (S,G2M)，G1 -> (0,0), S -> (1,0), G2M -> (0,1)
+            is_S   = (phase_ids == 1).float().unsqueeze(1)               # [B,1]
+            is_G2M = (phase_ids == 2).float().unsqueeze(1)               # [B,1]
+            # [B,G] = is_S * beta[:,0]^T + is_G2M * beta[:,1]^T
+            cycle_term = is_S @ self.beta_cycle[:,0].unsqueeze(0) + is_G2M @ self.beta_cycle[:,1].unsqueeze(0)
+            log_mu = torch.log(self.mu_control.unsqueeze(0)) + delta_log_mu + cycle_term
+        else:
+            log_mu = torch.log(self.mu_control.unsqueeze(0)) + delta_log_mu
+        if offset_log_s is not None:
+            log_mu = log_mu + offset_log_s.unsqueeze(1) # [B,G]
+
+        mu_pred = torch.exp(log_mu)
+        return torch.clamp(mu_pred, min=1e-10, max=1e7)
+
+    # --------- 多种损失（deviance / 变换刻度 MSE） ----------
+    @staticmethod
+    def loss_pois_dev(mu_pred, y_true, eps=1e-8):
+        # 2 * [y*log(y/mu) - (y-mu)], with y*log(y/mu)=0 when y=0
+        y = y_true
+        mu = mu_pred.clamp_min(eps)
+        term = torch.zeros_like(mu)
+        mask = y > 0
+        term[mask] = y[mask] * (torch.log(y[mask] + eps) - torch.log(mu[mask]))
+        dev = 2.0 * (term - (y - mu))
+        return dev.mean()
+
+    def loss_nb_dev(self, mu_pred, y_true, eps=1e-8):
+        # 2 * [ y*log(y/mu) - (y+theta)*log((y+theta)/(mu+theta)) ]
+        y = y_true
+        mu = mu_pred.clamp_min(eps)
+        theta = self.theta.unsqueeze(0).expand_as(mu).clamp_min(eps)
+        term1 = torch.zeros_like(mu)
+        mask = y > 0
+        term1[mask] = y[mask] * (torch.log(y[mask] + eps) - torch.log(mu[mask]))
+        term2 = (y + theta) * (torch.log(y + theta + eps) - torch.log(mu + theta))
+        dev = 2.0 * (term1 - term2)
+        return dev.mean()
+
+    @staticmethod
+    def loss_mse(mu_pred, y_true):
+        return nn.MSELoss()(mu_pred, y_true)
+
+    @staticmethod
+    def loss_mse_log1p(mu_pred, y_true):
+        return nn.MSELoss()(torch.log1p(mu_pred), torch.log1p(y_true))
+
+    @staticmethod
+    def loss_mse_anscombe(mu_pred, y_true):
+        # Anscombe transform: z = 2*sqrt(y + 3/8)
+        z_true = 2.0 * torch.sqrt(y_true + 0.375)
+        z_pred = 2.0 * torch.sqrt(mu_pred + 0.375)
+        return nn.MSELoss()(z_pred, z_true)
+
+
+    # ========= 统一的训练接口：fit(dataloader, ...) =========
+    def fit(self,
+            dataloader: DataLoader,
+            loss_type: str = "MSE",
+            learning_rate: float = 5e-4,
+            n_epochs: int = 100,
+            l1_lambda: float = 0.001,
+            l2_lambda: float = 0.01):
+        """
+        统一训练循环：dataloader 每个 batch 提供
+          - batch['pert']: LongTensor [B]
+          - batch['y']   : FloatTensor [B,G]（目标均值，已在外部完成 sf 或 pseudo-bulk）
+          - （可选）batch['phase']: LongTensor [B]，当 use_cycle=True
+        """
+        optimizer = optim.AdamW(self.parameters(), lr=learning_rate)
+
+        def _loss(mu_pred, y_true):
+            lt = loss_type.upper()
+            if lt == "MSE":        return self.loss_mse(mu_pred, y_true)
+            if lt == "NB":         return self.negative_binomial_nll_loss(mu_pred, y_true)
+            if lt == "POIS_DEV":   return self.loss_pois_dev(mu_pred, y_true)
+            if lt == "NB_DEV":     return self.loss_nb_dev(mu_pred, y_true)
+            if lt == "MSE_LOG1P":  return self.loss_mse_log1p(mu_pred, y_true)
+            if lt == "MSE_ANS":    return self.loss_mse_anscombe(mu_pred, y_true)
+            raise ValueError(f"Unknown loss_type: {loss_type}")
+
+        pbar = tqdm(range(n_epochs), desc="训练中 (GPU, unified)")
+        for epoch in pbar:
+            epoch_loss = 0.0
+            for batch in dataloader:
+                pert = batch['pert'].to(self.device)
+                y_true = batch['y'].to(self.device)
+                log_s = batch['log_s'].to(self.device)
+                phase = batch.get('phase', None)
+                if phase is not None:
+                    phase = phase.to(self.device)
+
+                optimizer.zero_grad()
+                mu_pred = self.forward(pert, phase, offset_log_s=log_s)  # [B,G]
+                loss = _loss(mu_pred, y_true) + l1_lambda * self.K.abs().sum() + l2_lambda * (self.K ** 2).sum()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+                optimizer.step()
+                epoch_loss += loss.item() * y_true.size(0)
+
+            avg_loss = epoch_loss / max(1, len(dataloader.dataset))
+            pbar.set_postfix(loss=f"{avg_loss:.4f}")
+
+
+    def negative_binomial_nll_loss(self, mu, y_true):
+        """NB 对数似然（允许 y_true 为实数，使用 Γ 的连续延拓）。"""
+        eps = 1e-8
+        theta_broadcast = self.theta.unsqueeze(0)
+        log_theta_mu_eps = torch.log(theta_broadcast + mu + eps)
+        ll = (
+            torch.lgamma(theta_broadcast + y_true + eps)
+            - torch.lgamma(theta_broadcast + eps)
+            - torch.lgamma(y_true + 1.0)
+            + theta_broadcast * torch.log(theta_broadcast + eps)
+            - theta_broadcast * log_theta_mu_eps
+            + y_true * torch.log(mu + eps)
+            - y_true * log_theta_mu_eps
+        )
+        return -ll.mean()
+    
+    def mse_loss(self, mu, y_true):
+        return nn.MSELoss()(mu, y_true)
+
+    @torch.no_grad()
+    def predict_and_sample(self, 
+        pert_ids_test: torch.LongTensor,
+        batch_size: int = 1024,
+        use_sf: bool = True,
+        sf_test: torch.Tensor | None = None,        # [N_test] 若 use_sf=False 可传 None
+        use_gamma: bool = True,
+        gamma_r0: float = 50.0,
+        sampler: str = "poisson",
+        use_cycle: bool = False,
+        phase_ids_test: torch.LongTensor | None = None  # [N_test] in {0,1,2}，若 use_cycle=True 必须提供
+    ) -> torch.Tensor:
+        """
+        预测并采样：
+          mu_ref = forward(pert_ids, [phase_ids])
+          mu_obs = (use_sf ? sf_test : 1) * mu_ref
+          若 use_gamma: mu_obs = (Gamma(r0,r0) per cell) * mu_obs
+          采样：poisson 或 nb（logits参数化；mean=mu_obs）
+        """
+        print(f"开始分批预测并采样，批大小为 {batch_size}...")
+        self.eval() 
+        all_sampled_counts = []
+        pbar = tqdm(range(0, len(pert_ids_test), batch_size), desc="预测中")
+        with torch.no_grad():
+            for i in pbar:
+                sl = slice(i, i + batch_size)
+                batch_pert_ids = pert_ids_test[sl].to(self.device)
+                if use_cycle:
+                    assert phase_ids_test is not None
+                    batch_phase_ids = phase_ids_test[sl].to(self.device)
+                else:
+                    batch_phase_ids = None
+                if use_sf:
+                    sfb = sf_test[sl].to(self.device, non_blocking=True)
+                    log_sfb = torch.log(sfb.clamp_min(1e-12))
+                else:
+                    log_sfb = None
+                mu_obs = self.forward(batch_pert_ids, batch_phase_ids, offset_log_s=log_sfb)  # [B,G]
+
+                if use_gamma:
+                    r0 = torch.tensor(gamma_r0, device=self.device)
+                    L = torch.distributions.Gamma(concentration=r0, rate=r0).sample((mu_obs.size(0),)).unsqueeze(1)
+                    mu_obs = (mu_obs * L).clamp(min=1e-12)
+
+                if sampler == "poisson":
+                    sampled_counts_batch = torch.distributions.Poisson(mu_obs).sample()
+                elif sampler == "nb":
+                    theta_b = self.theta.unsqueeze(0)
+                    logits = torch.log(theta_b) - torch.log(mu_obs)         # logit(p)=log(theta)-log(mu)
+                    logits = logits.clamp(min=-40.0, max=40.0)
+                    nb_dist = torch.distributions.NegativeBinomial(total_count=theta_b, logits=logits)
+                    sampled_counts_batch = nb_dist.sample()
+                else:
+                    raise ValueError("sampler must be 'poisson' or 'nb'")
+
+                all_sampled_counts.append(sampled_counts_batch.cpu())
+        print("所有批次预测完成，正在拼接结果...")
+        final_sampled_counts = torch.cat(all_sampled_counts, dim=0)
+        print("采样完成！")
+        return final_sampled_counts
+
+# ===================================================================
+# 2. 主执行逻辑
+# ===================================================================
+def main():
+    start = time.time()
+    ap = argparse.ArgumentParser(description="Estimate NB_GLM (concise, size factor & cell cycle & heterogeneity)")
+    ap.add_argument("--task", choices=['test','real'],default='test', help="If test, run local evaluation after writing h5ad; if real, only write h5ad.")
+    ap.add_argument("--cheat", action="store_true", help="Use train data to test.")
+    # Loss 扩展：MSE（默认）、NB、POIS_DEV、NB_DEV、MSE_LOG1P、MSE_ANS
+    ap.add_argument("--loss", choices=["MSE","NB","POIS_DEV","NB_DEV","MSE_LOG1P","MSE_ANS"], default="MSE",
+                    help="Loss for concise training.")
+    ap.add_argument("--fit", choices=['concise','whole'], default='concise', help="Concise will use pseudo-bulk; whole uses all cells directly.")
+    ap.add_argument("--gpu", type=int, default=0, help="GPU ID to use.")
+    ap.add_argument("--sample_n", type=int, default=1, help="How many h5ad files to generate and evaluate.")
+    ap.add_argument("--seed", type=int, default=2025, help="Base random seed.")
+
+    # 是否使用 size factor（训练与采样）
+    ap.add_argument("--use_sf", action="store_true", help="Use size factor in training (concise) and sampling.")
+    # 细胞间异质性
+    ap.add_argument("--use_gamma", action="store_true", help="Use shared Gamma(r0,r0) cell-level heterogeneity in sampling.")
+    ap.add_argument("--gamma_r0", type=float, default=50.0, help="Gamma shape=rate r0; larger => less heterogeneity.")
+    # 采样分布
+    ap.add_argument("--sampler", choices=["poisson","nb"], default="poisson", help="Sampling distribution at prediction.")
+
+    # 新增：是否使用 cell cycle 协变量（训练与采样）
+    ap.add_argument("--use_cycle", action="store_true", help="Use cell cycle (phase) fixed effects (G1 baseline; S/G2M learned).")
+    # 预测阶段如何指定 phase
+    ap.add_argument("--phase_strategy", choices=["ignore","global","control","fixed_G1","fixed_S","fixed_G2M"], default="global",
+                    help="How to assign phases to generated cells when --use_cycle.")
+    ap.add_argument("--lambda_l1", type=float, default=0.0001, help="L1 lambda for regularization.")
+    ap.add_argument("--lambda_l2", type=float, default=0.005, help="L2 lambda for regularization.")
+
+    args = ap.parse_args()
+
+    # Arc
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu) 
+    if args.task == 'real':
+        TRAIN_DATA_PATH = "../vcc_data/adata_pp.h5ad"
+        GENE_EMBEDDING_PATH = '../vcc_data/PCA_gene_embedding_512D.csv'
+        PERT_EMBEDDING_PATH = "../vcc_data/perturbation_embedding_P_512D_cpu.csv"
+        VALIDATION_LIST_PATH = "../vcc_data/pert_counts_Validation.csv"
+        OUTPUT_PATH = "NBGLM_0924_size_factor_seed114514.h5ad"
+        PERT_NAME = "target_gene"
+    else:
+        if args.cheat:
+            TRAIN_DATA_PATH = "../vcc_data/adata_pp.h5ad"
+        else:
+            TRAIN_DATA_PATH = "../vcc_data/Official_Data_Split/train.h5ad"
+        GENE_EMBEDDING_PATH = '../vcc_data/PCA_gene_embedding_512D.csv'
+        PERT_EMBEDDING_PATH = "../vcc_data/perturbation_embedding_P_512D_cpu.csv"
+        VALIDATION_LIST_PATH = "../vcc_data/Official_Data_Split/test_pert_info.csv"
+        OUTPUT_PATH = "nbglm_concise_cycle_out_test.h5ad"
+        PERT_NAME = "target_gene"
+
+    CONTROL_PERT_NAME = "non-targeting"
+    LEARNING_RATE = 5e-4
+    N_EPOCHS = 100
+    PREDICTION_BATCH_SIZE = 4096
+    LOSS = args.loss
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    # --- 1. 加载所有数据和元信息 (使用原始计数) ---
+    print(f"--- 1. 加载所有数据和元信息 ---")
+    start_time = time.time()
+    adata = sc.read_h5ad(TRAIN_DATA_PATH)
+    print("数据加载完成，使用原始计数。")
+    gene_names = adata.var.index.tolist()
+    
+    train_perts = set(adata.obs[PERT_NAME].unique())
+    df_val = pd.read_csv(VALIDATION_LIST_PATH)
+    val_perts = set(df_val['target_gene'].tolist())
+    all_perts_set = train_perts.union(val_perts)
+    all_perts_list = sorted(list(all_perts_set))
+    if CONTROL_PERT_NAME in all_perts_list:
+        all_perts_list.remove(CONTROL_PERT_NAME)
+        all_perts_list.insert(0, CONTROL_PERT_NAME)
+    pert_to_id = {name: i for i, name in enumerate(all_perts_list)}
+    
+    # --- 2. 加载和准备全局嵌入矩阵 G 和 P ---
+    print(f"\n--- 2. 加载和准备全局嵌入矩阵 G 和 P ---")
+    gene_embeddings = pd.read_csv(GENE_EMBEDDING_PATH, index_col=0)
+    gene_dict = {gene: torch.tensor(row.values, dtype=torch.float32) for gene, row in gene_embeddings.iterrows()}
+    pert_embeddings = pd.read_csv(PERT_EMBEDDING_PATH, index_col=0)
+    pert_dict = {gene: torch.tensor(row.values, dtype=torch.float32) for gene, row in pert_embeddings.iterrows()}
+    gene_emb_dim = next(iter(gene_dict.values())).shape[0]
+    pert_emb_dim = next(iter(pert_dict.values())).shape[0]
+    G_matrix = torch.zeros(len(gene_names), gene_emb_dim)
+    P_matrix = torch.zeros(len(all_perts_list), pert_emb_dim)
+    for i, name in enumerate(gene_names):
+        if name in gene_dict: G_matrix[i] = gene_dict[name]
+    for i, name in enumerate(all_perts_list):
+        if name in pert_dict: P_matrix[i] = pert_dict[name]
+        
+    G_matrix = torch.nn.functional.normalize(G_matrix, p=2, dim=1)
+    P_matrix = torch.nn.functional.normalize(P_matrix, p=2, dim=1)
+
+    # --- 3. 准备训练数据张量 (CPU；避免OOM) ---
+    print(f"\n--- 3. 准备训练数据张量 ---")
+    adata_ctrl = adata[adata.obs[PERT_NAME] == CONTROL_PERT_NAME].copy()
+    adata_pert = adata[adata.obs[PERT_NAME] != CONTROL_PERT_NAME].copy()
+
+    X_pert_train = to_tensor(adata_pert.X)   # CPU
+    X_ctrl_all = to_tensor(adata_ctrl.X)     # CPU
+
+    # size factor（以 control 的中位深度为参考）；若不使用 sf，也仍计算以支持采样阶段可选使用
+    sf_ctrl, ref_depth = compute_size_factors(X_ctrl_all)
+    sf_pert, _ = compute_size_factors(X_pert_train, ref_depth)
+
+    # mu_control & theta：若使用 sf，则先标准化到参考深度再估计；否则直接估计
+    if args.use_sf:
+        X_ctrl_norm = X_ctrl_all / sf_ctrl.unsqueeze(1)
+        mu_control = X_ctrl_norm.mean(dim=0)
+        theta_vector = estimate_theta_per_gene(X_ctrl_norm)
+    else:
+        mu_control = X_ctrl_all.mean(dim=0)
+        theta_vector = estimate_theta_per_gene(X_ctrl_all)
+
+    # 训练用的扰动 id
+    pert_names_train = adata_pert.obs[PERT_NAME].tolist()
+    pert_ids_train = torch.tensor([pert_to_id[p] for p in pert_names_train], dtype=torch.long)
+
+    # 若启用 cell cycle：把 adata_pert.obs['phase'] 映射为 {0:G1,1:S,2:G2M}
+    if args.use_cycle:
+        if "phase" not in adata_pert.obs.columns:
+            raise RuntimeError("use_cycle=True 但 adata.obs['phase'] 不存在。")
+        phase_ids_train = phases_to_ids(adata_pert.obs["phase"].tolist())
+    else:
+        phase_ids_train = None
+
+    
+    # --- 4. 实例化并训练（使用统一的 dataloader 接口） ---
+    print(f"\n--- 4. 实例化并训练 NB-GLM 模型 ---")
+    model = LowRankNB_GLM(
+        gene_emb=G_matrix,
+        pert_emb=P_matrix,
+        mu_control=mu_control,
+        theta_per_gene=theta_vector,
+        use_cycle=args.use_cycle
+    )
+
+    # 根据 args.fit 选择数据构建方式
+    if args.fit == 'whole':
+        # per-cell 数据集（已在外部做 size factor 归一）
+        whole_ds = WholeCellDataset(
+            X_tensor=X_pert_train,
+            pert_ids=pert_ids_train,
+            sf=(sf_pert if args.use_sf else None),
+            use_sf=args.use_sf,
+            use_cycle=args.use_cycle,
+            phase_ids=phase_ids_train
+        )
+        train_loader = DataLoader(whole_ds, batch_size=max(1, PREDICTION_BATCH_SIZE // 4), shuffle=True, drop_last=False)
+    elif args.fit == 'concise':
+        # concise：先在外部构建 pseudo-bulk，再用 DataLoader
+        Y_avg, unique_perts_eff, phase_ids_eff, log_s_eff = build_pseudobulk(
+            X_pert_train=X_pert_train,
+            pert_ids_train=pert_ids_train,
+            sf_pert=(sf_pert if args.use_sf else None),
+            ref_depth=ref_depth,
+            use_sf=args.use_sf,
+            use_cycle=args.use_cycle,
+            phase_ids_train=phase_ids_train,
+            batch_size=PREDICTION_BATCH_SIZE
+        )
+        if args.use_cycle:
+            pb_ds = PseudoBulkDataset(
+                Y_avg=Y_avg,                         # [B_eff,G]
+                pert_ids_eff=unique_perts_eff,       # [B_eff]
+                use_cycle=True,
+                phase_ids_eff=phase_ids_eff,          # [B_eff]
+                log_s_eff=log_s_eff
+            )
+        else:
+            pb_ds = PseudoBulkDataset(
+                Y_avg=Y_avg,                         # [K,G]
+                pert_ids_eff=unique_perts_eff,       # [K]
+                use_cycle=False,
+                phase_ids_eff=None,
+                log_s_eff=log_s_eff
+            )
+        train_loader = DataLoader(pb_ds, batch_size=max(1, PREDICTION_BATCH_SIZE // 4), shuffle=True, drop_last=False)
+    else:
+        raise ValueError("fit must be 'whole' or 'concise'")
+
+    # 统一训练入口
+    model.fit(
+        dataloader=train_loader,
+        loss_type=LOSS,
+        learning_rate=LEARNING_RATE,
+        n_epochs=N_EPOCHS,
+        l1_lambda=args.lambda_l1,
+        l2_lambda=args.lambda_l2
+    )
+    
+    # --- 5. 准备预测任务 ---
+    print(f"\n--- 5. 准备预测任务 ---")
+    val_pert_names = df_val['target_gene'].tolist()
+    n_cells_per_val_pert = df_val['n_cells'].tolist()
+    pert_ids_test_list = []
+    for name, n_cells in zip(val_pert_names, n_cells_per_val_pert):
+        pert_ids_test_list.extend([pert_to_id[name]] * int(n_cells))
+    pert_ids_test = torch.tensor(pert_ids_test_list, dtype=torch.long)
+
+    # 若使用 sf：根据 csv median_umi_per_cell + control sf 分布构造 sf_test；否则为 None
+    if args.use_sf:
+        sf_test = build_validation_size_factors(df_val, sf_ctrl, ref_depth, seed=args.seed)
+        assert sf_test.numel() == len(pert_ids_test_list)
+    else:
+        sf_test = None
+
+    # 若使用 cell cycle：根据策略生成 phase_ids_test
+    if args.use_cycle:
+        # 计算全局/每扰动的 phase 概率（基于训练集）
+        global_probs = compute_global_phase_probs(adata.obs["phase"].tolist() if "phase" in adata.obs.columns else [])
+        per_pert_probs = compute_per_pert_phase_probs(adata_pert, PERT_NAME) if args.phase_strategy == "control" else None
+        phase_ids_list = sample_validation_phases(df_val, args.phase_strategy, global_probs, per_pert_probs, seed=args.seed)
+        phase_ids_test = torch.tensor(phase_ids_list, dtype=torch.long)
+        assert phase_ids_test.numel() == len(pert_ids_test_list)
+    else:
+        phase_ids_test = None
+    
+    # --- 6. 执行预测（包含可选的细胞间异质性 & cell cycle） ---
+    print(f"\n--- 6. 执行预测 ---")
+    sampled_counts = model.predict_and_sample(
+        pert_ids_test=pert_ids_test, 
+        batch_size=PREDICTION_BATCH_SIZE,
+        use_sf=args.use_sf,
+        sf_test=sf_test,
+        use_gamma=args.use_gamma,
+        gamma_r0=args.gamma_r0,
+        sampler=args.sampler,
+        use_cycle=args.use_cycle,
+        phase_ids_test=phase_ids_test
+    )
+    final_predictions_tensor = sampled_counts.cpu()
+    
+    # --- 7. 组装并保存最终的 anndata 对象 ---
+    print(f"\n--- 7. 组装并保存最终的 h5ad 文件 ---")
+    adata_output_ctrl = adata[adata.obs[PERT_NAME] == CONTROL_PERT_NAME].copy()
+    obs_pred = pd.DataFrame({PERT_NAME: [all_perts_list[i] for i in pert_ids_test_list]})
+    if args.use_cycle:
+        # 方便下游分析：把生成的 phase 也写到 obs（若选择 ignore/fixed_... 会是单一值）
+        phase_str = {0:"G1", 1:"S", 2:"G2M"}
+        obs_pred["phase"] = [phase_str.get(int(x), "G1") for x in (phase_ids_test.tolist() if phase_ids_test is not None else [0]*len(obs_pred))]
+    adata_pred = ad.AnnData(X=final_predictions_tensor.numpy(), obs=obs_pred, var=adata.var.copy())
+    
+    final_adata = ad.concat([adata_output_ctrl, adata_pred], join='outer', index_unique=None)
+    final_adata.X = final_adata.X.astype(np.float32)
+
+    final_adata.write(OUTPUT_PATH)
+    print(f"成功将最终结果保存至: {OUTPUT_PATH}")
+    print(f"--- 总耗时: {time.time() - start_time:.2f} 秒 ---")
+    if args.task == 'test':
+        cmd = ["python", "eval.py", "--prediction", OUTPUT_PATH]
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in process.stdout:
+            print(line, end="") 
+        process.wait()
+
+if __name__ == '__main__':
+    main()
+
+```
+
+--- FILE: README.md ---
+```
+# nbglm
+
+A small, configuration-driven project structure for **Low-Rank NB-GLM** on perturb-seq style data.
+
+> 目标（Goal）  
+> 将单脚本重构为**简洁可维护**的小型工程，配置（YAML）驱动，入口统一（`python run.py`），
+> 支持“训练 + 采样 + 评估”等组合流程，并为后续 **k-fold CV**、**内存直连评估（采样→评估）** 留好接口。
+
+---
+
+## Directory
+
+```
+nbglm/
+├── config/
+│ └── default.yaml
+├── src/nbglm/
+│ ├── init.py
+│ ├── data_io.py
+│ ├── dataset.py
+│ ├── model.py
+│ ├── eval.py
+│ ├── pipelines.py
+│ ├── utils.py
+│ └── types.py
+├── run.py
+├── README.md
+└── requirements.txt
+```
+
+
+## Quickstart
+
+1. Prepare data paths in `config/default.yaml`:
+   - training h5ad(s)
+   - test h5ad (for evaluation)
+   - embeddings (gene / perturbation)
+   - validation list CSV (`target_gene, n_cells, median_umi_per_cell`)
+
+2. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+
+3. Run:
+
+```
+python run.py
+# or
+python run.py --config path/to/exp.yaml
+```
+
+Outputs will be placed under `outputs/{experiment_name}__{timestamp}`/ with:
+
++ `ckpt`/ model checkpoint
++ preds/ sampled predictions (pred.h5ad)
++ metrics/ evaluation metrics (metrics.json)
++ logs/ logs
+
+## Configuration Tips
+
++ `pipeline.mode`: one of
+   + `train_sample_eval`
+   + `train_sample`
+   + `sample_eval` (requires `pipeline.pretrained_ckpt`)
+   + `sample`
+   + `evaluate_only` (requires `paths.pred_h5ad`)
+
++ To switch **whole-cell** vs **pseudo-bulk** training:
+   + `train.fit_mode: whole | concise`
+
++ To use cell cycle covariate:
+   + `model.use_cycle: true` and ensure `data.phase_column` exists.
+
+
+## Notes
+
++ The project uses **row-wise L2 normalized embeddings** by default.
+
++ Checkpoints include `G/P` matrices, `mu_control`, and `theta` to ensure portability.
+```
+
+--- FILE: run.py ---
+```
+# run.py
+# -*- coding: utf-8 -*-
+"""
+统一入口（Entry Point）
+======================
+
+使用方式：
+----------
+1) 直接运行默认配置：
+   $ python run.py
+
+2) 指定配置文件（YAML）：
+   $ python run.py --config path/to/exp.yaml
+   或设置环境变量：
+   $ NBGLM_CONFIG=path/to/exp.yaml python run.py
+"""
+
+from __future__ import annotations
+
+import os
+import argparse
+import json
+from typing import Dict, Any
+import anndata
+
+try:
+    import yaml
+    _HAS_YAML = True
+except Exception:
+    _HAS_YAML = False
+
+from src.nbglm import data_io, pipelines, utils
+
+def anndata_to_dict(obj):
+    if isinstance(obj, anndata.AnnData):
+        return obj.to_dict()  # Convert AnnData to a dictionary or another serializable format
+    raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+
+def _load_cfg(path: str) -> Dict[str, Any]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"[run] 配置文件不存在: {path}")
+    if _HAS_YAML and (path.endswith(".yaml") or path.endswith(".yml")):
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f)
+    else:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+def _parse_value(s):
+    import json
+    sl = s.strip()
+    # 优先尝试 JSON（支持 true/false/null、数字、列表、对象）
+    try:
+        return json.loads(sl)
+    except Exception:
+        pass
+    # 常见布尔/None
+    if sl.lower() in ("true", "false"):
+        return sl.lower() == "true"
+    if sl.lower() in ("none", "null"):
+        return None
+    # 尝试数字
+    try:
+        if "." in sl:
+            return float(sl)
+        return int(sl)
+    except Exception:
+        return sl  # 回退为字符串
+
+def _set_by_dots(d, key, value):
+    ks = key.split(".")
+    cur = d
+    for k in ks[:-1]:
+        if k not in cur or not isinstance(cur[k], dict):
+            cur[k] = {}
+        cur = cur[k]
+    cur[ks[-1]] = value
+
+
+def main():
+    parser = argparse.ArgumentParser(description="nbglm runner")
+    parser.add_argument("--config", type=str, default=None, help="YAML 配置文件路径")
+    parser.add_argument("--set", action="append", default=[], help="覆盖配置，点号路径：如 train.epochs=50 或 model.use_cycle=false（可多次）")
+
+    args = parser.parse_args()
+
+    cfg_path = args.config or os.environ.get("NBGLM_CONFIG", "configs/default.yaml")
+    cfg = _load_cfg(cfg_path)
+
+
+    # 应用 --set 覆盖
+    for item in args.set:
+        if "=" not in item:
+            raise ValueError(f"--set 需要 key=value 格式，但得到: {item}")
+        k, v = item.split("=", 1)
+        _set_by_dots(cfg, k.strip(), _parse_value(v))
+
+
+    # 输出目录与日志
+    run_dirs = data_io.make_run_dirs(
+        outputs_root=cfg["paths"].get("outputs_root", "./outputs"),
+        experiment_name=cfg["experiment"].get("name", "nbglm_experiment"),
+    )
+    data_io.save_config_snapshot(cfg, run_dirs["run_dir"])
+    logger = utils.get_logger(run_dirs["run_dir"])
+    utils.set_seed(int(cfg["experiment"].get("seed", 2025)))
+    logger.info(f"Loaded config from: {cfg_path}")
+
+    # 分发 pipeline
+    mode = cfg.get("pipeline", {}).get("mode", "train_sample_eval").lower()
+    logger.info(f"Pipeline mode = {mode}")
+
+    if mode == "train_sample_eval":
+        out = pipelines.run_train_sample_eval(cfg, run_dirs)
+    elif mode == "train_sample":
+        out = pipelines.run_train_sample(cfg, run_dirs)
+    elif mode == "sample_eval":
+        out = pipelines.run_sample_eval(cfg, run_dirs)
+    elif mode == "sample":
+        out = pipelines.run_sample_only(cfg, run_dirs)
+    elif mode == "evaluate_only":
+        out = pipelines.run_evaluate_only(cfg, run_dirs)
+    else:
+        raise ValueError(f"[run] 未知 pipeline.mode: {mode}")
+
+    logger.info(f"Done. Summary: {json.dumps(out, ensure_ascii=False, indent=2, default=anndata_to_dict)}")
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+--- FILE: outputs/baseline_nbglm__20250930_020827/config.yaml ---
+```
+experiment:
+  name: baseline_nbglm
+  seed: 2025
+  device: auto
+paths:
+  train_h5ad: ./data/adata_pp.h5ad
+  train_split_h5ad: ./data/Official_Data_Split/train.h5ad
+  test_h5ad: ./data/Official_Data_Split/test.h5ad
+  val_list_csv: ./data/Official_Data_Split/test_pert_info.csv
+  gene_embedding_csv: ./data/PCA_gene_embedding_512D.csv
+  pert_embedding_csv: ./data/perturbation_embedding_P_512D_cpu.csv
+  outputs_root: ./outputs
+data:
+  pert_name_col: target_gene
+  control_name: non-targeting
+  use_split: true
+  phase_column: phase
+model:
+  name: lowrank_nb_glm
+  use_cycle: false
+  losses:
+    primary: MSE
+  regularization:
+    l1: 1e-4
+    l2: 5e-3
+train:
+  fit_mode: concise
+  lr: 5e-4
+  epochs: 100
+  batch_size: 2048
+size_factor:
+  use_sf: true
+sampling:
+  sampler: nb
+  batch_size: 4096
+  gamma_heterogeneity:
+    enable: false
+    r0: 50.0
+  phase_strategy: global
+evaluate:
+  enable: true
+  metrics:
+  - MAE
+  - PDS
+  - DES
+  n_jobs: auto
+pipeline:
+  mode: train_sample_eval
+  persist_intermediate: false
+
+```
+
+--- FILE: outputs/baseline_nbglm__20250930_020827/metrics/metrics.json ---
+```
+{
+  "MAE": 0.9460442662239075,
+  "PDS": 0.5166666666666667,
+  "DES": 0.2722323699340577
+}
+```
+
+--- FILE: outputs/baseline_nbglm__20250930_021716/config.yaml ---
+```
+experiment:
+  name: baseline_nbglm
+  seed: 2025
+  device: auto
+paths:
+  train_h5ad: ./data/adata_pp.h5ad
+  train_split_h5ad: ./data/Official_Data_Split/train.h5ad
+  test_h5ad: ./data/Official_Data_Split/test.h5ad
+  val_list_csv: ./data/Official_Data_Split/test_pert_info.csv
+  gene_embedding_csv: ./data/PCA_gene_embedding_512D.csv
+  pert_embedding_csv: ./data/perturbation_embedding_P_512D_cpu.csv
+  outputs_root: ./outputs
+data:
+  pert_name_col: target_gene
+  control_name: non-targeting
+  use_split: true
+  phase_column: phase
+model:
+  name: lowrank_nb_glm
+  use_cycle: false
+  losses:
+    primary: MSE
+  regularization:
+    l1: 1e-4
+    l2: 5e-3
+train:
+  fit_mode: concise
+  lr: 5e-4
+  epochs: 100
+  batch_size: 2048
+size_factor:
+  use_sf: true
+sampling:
+  sampler: nb
+  batch_size: 4096
+  gamma_heterogeneity:
+    enable: false
+    r0: 50.0
+  phase_strategy: global
+evaluate:
+  enable: true
+  metrics:
+  - MAE
+  - PDS
+  - DES
+  n_jobs: auto
+pipeline:
+  mode: train_sample_eval
+  persist_intermediate: true
+
+```
+
+--- FILE: outputs/baseline_nbglm__20250930_021716/metrics/metrics.json ---
+```
+{
+  "MAE": 0.9460442662239075,
+  "PDS": 0.5166666666666667,
+  "DES": 0.2722323699340577
+}
+```
+
+--- FILE: outputs/baseline_nbglm__20250929_151240/config.yaml ---
+```
+experiment:
+  name: baseline_nbglm
+  seed: 2025
+  device: auto
+paths:
+  train_h5ad: ./data/adata_pp.h5ad
+  train_split_h5ad: ./data/Official_Data_Split/train.h5ad
+  test_h5ad: ./data/Official_Data_Split/test.h5ad
+  val_list_csv: ./data/Official_Data_Split/test_pert_info.csv
+  gene_embedding_csv: ./data/PCA_gene_embedding_512D.csv
+  pert_embedding_csv: ./data/perturbation_embedding_P_512D_cpu.csv
+  outputs_root: ./outputs
+data:
+  pert_name_col: target_gene
+  control_name: non-targeting
+  use_split: true
+  phase_column: phase
+model:
+  name: lowrank_nb_glm
+  use_cycle: false
+  losses:
+    primary: MSE
+  regularization:
+    l1: 1e-4
+    l2: 5e-3
+train:
+  fit_mode: concise
+  lr: 5e-4
+  epochs: 100
+  batch_size: 2048
+size_factor:
+  use_sf: true
+sampling:
+  sampler: nb
+  batch_size: 4096
+  gamma_heterogeneity:
+    enable: false
+    r0: 50.0
+  phase_strategy: global
+evaluate:
+  enable: true
+  metrics:
+  - MAE
+  - PDS
+  - DES
+  n_jobs: auto
+pipeline:
+  mode: train_sample_eval
+  persist_intermediate: true
+
+```
+
+--- FILE: outputs/baseline_nbglm__20250929_150919/config.yaml ---
+```
+experiment:
+  name: baseline_nbglm
+  seed: 2025
+  device: auto
+paths:
+  train_h5ad: ./data/adata_pp.h5ad
+  train_split_h5ad: ./data/Official_Data_Split/train.h5ad
+  test_h5ad: ./data/Official_Data_Split/test.h5ad
+  val_list_csv: ./data/Official_Data_Split/test_pert_info.csv
+  gene_embedding_csv: ./data/PCA_gene_embedding_512D.csv
+  pert_embedding_csv: ./data/perturbation_embedding_P_512D_cpu.csv
+  outputs_root: ./outputs
+data:
+  pert_name_col: target_gene
+  control_name: non-targeting
+  use_split: true
+  phase_column: phase
+model:
+  name: lowrank_nb_glm
+  use_cycle: false
+  losses:
+    primary: MSE
+  regularization:
+    l1: 1e-4
+    l2: 5e-3
+train:
+  fit_mode: concise
+  lr: 5e-4
+  epochs: 100
+  batch_size: 2048
+size_factor:
+  use_sf: true
+sampling:
+  sampler: nb
+  batch_size: 4096
+  gamma_heterogeneity:
+    enable: false
+    r0: 50.0
+  phase_strategy: global
+evaluate:
+  enable: true
+  metrics:
+  - MAE
+  - PDS
+  - DES
+  n_jobs: auto
+pipeline:
+  mode: train_sample_eval
+  persist_intermediate: false
+
+```
+
+--- FILE: configs/default.yaml ---
+```
+# =========================
+# nbglm: default.yaml
+# =========================
+# 约定：所有键名与 src/nbglm/* 中的代码严格对齐。
+# 如需修改，请尽量维持结构不变，仅改数值。
+
+experiment:
+  name: "baseline_nbglm"   # 本次实验名（用于输出目录命名）
+  seed: 2025               # 全局随机种子
+  device: "auto"           # "auto" | "cpu" | "cuda" | "cuda:0" ...
+
+paths:
+  # 训练 / 评估数据路径（请按你的实际目录修改）
+  train_h5ad: "./data/adata_pp.h5ad"
+  train_split_h5ad: "./data/Official_Data_Split/train.h5ad"  # 当 data.use_split=true 时优先
+  test_h5ad: "./data/Official_Data_Split/test.h5ad"          # 评估时真实标签
+  val_list_csv: "./data/Official_Data_Split/test_pert_info.csv"  # 采样清单：target_gene, n_cells, median_umi_per_cell
+
+  # 嵌入（embeddings）
+  gene_embedding_csv: "./data/PCA_gene_embedding_512D.csv"
+  pert_embedding_csv: "./data/perturbation_embedding_P_512D_cpu.csv"
+
+  # 输出根目录（run 子目录将自动生成）
+  outputs_root: "./outputs"
+
+  # （可选）仅评估模式时指定已有预测文件：
+  # pred_h5ad: "./outputs/your_run/preds/pred.h5ad"
+
+data:
+  pert_name_col: "target_gene"   # 扰动列名
+  control_name: "non-targeting"  # 控制组名（将被放至扰动列表首位）
+  use_split: true                # true: 使用 train_split_h5ad；false: 使用 train_h5ad
+  phase_column: "phase"          # 细胞周期列名（G1/S/G2M），仅在 model.use_cycle=true 时使用
+
+model:
+  name: "lowrank_nb_glm"         # 目前仅此模型；为未来扩展做占位
+  use_cycle: false                # 是否在 log-mean 中加入 S/G2M 固定效应（G1 基线）
+  losses:
+    primary: "MSE"               # ["MSE","NB","POIS_DEV","NB_DEV","MSE_LOG1P","MSE_ANS"]
+  regularization:
+    l1: 1e-4
+    l2: 5e-3
+
+train:
+  fit_mode: "concise"            # ["concise","whole"]；concise=伪批训练（更省显存）
+  lr: 5e-4
+  epochs: 100
+  batch_size: 2048               # dataloader 基础批大小（内部会做些调整）
+
+size_factor:
+  use_sf: true                   # 是否在训练与采样使用 size factor 作为 offset（log_s）
+
+sampling:
+  sampler: "nb"             # ["poisson","nb"]
+  batch_size: 4096
+  gamma_heterogeneity:
+    enable: false                 # 是否在采样时引入 Gamma(r0,r0) 细胞级异质性
+    r0: 50.0
+  phase_strategy: "global"       # ["ignore","global","control","fixed_G1","fixed_S","fixed_G2M"]
+
+evaluate:
+  enable: true
+  metrics: ["MAE", "PDS", "DES"] # 需要的指标子集
+  n_jobs: "auto"                 # DES 并行核数（"auto"=80% CPU）
+
+pipeline:
+  mode: "train_sample_eval"      # ["train_sample_eval","train_sample","sample_eval","sample","evaluate_only"]
+  persist_intermediate: true     # true: 保存 ckpt/pred 文件；false: 采样→评估内存直连
+  # pretrained_ckpt: "./outputs/xxx/ckpt/model.pt"  # 当 mode=sample 或 sample_eval 时从该权重采样
+
+```
+
+--- FILE: src/nbglm/utils.py ---
+```
+# src/nbglm/utils.py
+# -*- coding: utf-8 -*-
+"""
+通用工具（Utilities）
+====================
+
+提供：
+- 随机种子（random seed）统一设置
+- 设备选择（device selection）
+- 日志系统（logging）封装
+- 简易文件/JSON 辅助函数
+"""
+
+from __future__ import annotations
+
+from typing import Optional, Dict
+import os
+import sys
+import json
+import random
+from pathlib import Path
+import logging
+import time
+
+import numpy as np
+
+try:
+    import torch
+except Exception:
+    torch = None  # 允许在无 torch 环境下导入本模块的非训练逻辑
+
+
+# -----------------------------
+# 随机种子
+# -----------------------------
+def set_seed(seed: int) -> None:
+    """
+    统一设置随机种子（random / numpy / torch）。
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    if torch is not None:
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+
+# -----------------------------
+# 设备选择
+# -----------------------------
+def get_device(cfg: Dict) -> str:
+    """
+    从 cfg.experiment.device 选择设备：
+    - "auto"（默认）：有 CUDA 则 "cuda" 否则 "cpu"
+    - "cuda" / "cuda:0" / "cpu"
+    """
+    dev = str(cfg.get("experiment", {}).get("device", "auto")).lower()
+    if dev == "auto":
+        if torch is not None and torch.cuda.is_available():
+            return "cuda"
+        return "cpu"
+    return dev
+
+
+# -----------------------------
+# 日志系统
+# -----------------------------
+def get_logger(run_dir: str, name: str = "nbglm") -> logging.Logger:
+    """
+    配置并返回一个 logger，同时输出到控制台与文件（logs/run.log）。
+    """
+    logs_dir = os.path.join(run_dir, "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    log_path = os.path.join(logs_dir, "run.log")
+
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False  # 避免重复输出
+
+    # 清理旧 handler（避免多次创建）
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+
+    fmt = logging.Formatter("[%(asctime)s][%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+    # 控制台
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+
+    # 文件
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    logger.info(f"Logger initialized. Log file: {log_path}")
+    return logger
+
+
+# -----------------------------
+# 其他小工具
+# -----------------------------
+def ensure_dir(path: str) -> None:
+    Path(path).mkdir(parents=True, exist_ok=True)
+
+
+def json_dump(path: str, obj) -> None:
+    ensure_dir(os.path.dirname(path) or ".")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+```
+
+--- FILE: src/nbglm/model.py ---
+```
+# src/nbglm/model.py
+# -*- coding: utf-8 -*-
+"""
+模型定义（Model Definition）与训练/采样接口
+========================================
+
+本模块提供低秩负二项广义线性模型（Low-Rank Negative Binomial GLM, *LowRankNB_GLM*），
+以及训练循环、损失函数（deviance/MSE 等）与采样（Poisson 或 NB，logits 参数化）接口。
+
+模型形式（Model Form）
+---------------------
+令：
+- 基因嵌入矩阵 $G \\in \\mathbb{R}^{\\,n_g \\times d_g}$；
+- 扰动嵌入矩阵 $P \\in \\mathbb{R}^{\\,n_p \\times d_p}$；
+- 低秩核 $K \\in \\mathbb{R}^{\\,d_g \\times d_p}$（可学习参数）；
+- 控制组均值（参考尺度）$\\mu^{\\mathrm{ctrl}} \\in \\mathbb{R}^{\\,n_g}$；
+- 周期固定效应（S/G2M 两路）$\\beta \\in \\mathbb{R}^{\\,n_g\\times 2}$（可选）；
+- size factor 偏置（offset）$\\log s_b$（样本维度）。
+
+对于第 b 个样本、基因 g，定义参考尺度（reference-scale）的对数均值：
+$$
+\\log \\mu^{(\\mathrm{ref})}_{bg}
+= \\log \\mu^{\\mathrm{ctrl}}_g
++ \\alpha_g\\, \\tanh\\!\\big(\\,(G K P_{b})_g\\,\\big)
++ \\beta_{g,S}\\,\\mathbf{1}[\\phi_b=\\mathrm{S}]
++ \\beta_{g,G2M}\\,\\mathbf{1}[\\phi_b=\\mathrm{G2M}]
++ \\log s_b,
+$$
+其中 $\\alpha_g$ 由 `delta_log_mu_scaler` 缩放控制，$\\phi_b \\in \\{\\mathrm{G1},\\mathrm{S},\\mathrm{G2M}\\}$。
+观测尺度（observation scale）期望 $\\mu^{(\\mathrm{obs})} = \\exp(\\log\\mu^{(\\mathrm{ref})})$。
+
+负二项分布采样（NB Sampling）
+-----------------------------
+采用 logits 参数化确保数值稳定性：
+- total_count = $\\theta_g$（基因特异的离散度参数）
+- logits = $\\log\\theta_g - \\log\\mu_{bg}^{(\\mathrm{obs})}$
+
+在此参数化下，NB 的均值 $\\mathbb{E}[Y]=\\mu$ 精确成立（除数值截断外）。
+
+正则化（Regularization）
+------------------------
+对核矩阵 K 应用 L1/L2 正则：
+$$
+\\mathcal{L}_{\\mathrm{reg}} = \\lambda_1 \\|K\\|_1 + \\lambda_2 \\|K\\|_F^2 .
+$$
+
+依赖（Dependencies）
+-------------------
+- torch（核心）
+- torch.distributions（采样）
+"""
+
+from __future__ import annotations
+
+from typing import Callable, Dict, Optional
+import math
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+
+# -----------------------------
+# 损失函数集合（Registry）
+# -----------------------------
+def _loss_mse(mu_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+    return nn.MSELoss()(mu_pred, y_true)
+
+
+def _loss_mse_log1p(mu_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+    return nn.MSELoss()(torch.log1p(mu_pred), torch.log1p(y_true))
+
+
+def _loss_mse_anscombe(mu_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+    """
+    Anscombe 变换：
+    z = 2 * sqrt(y + 3/8)，用于稳定方差（variance-stabilizing transform）。
+    """
+    z_true = 2.0 * torch.sqrt(y_true + 0.375)
+    z_pred = 2.0 * torch.sqrt(mu_pred + 0.375)
+    return nn.MSELoss()(z_pred, z_true)
+
+
+def _loss_pois_dev(mu_pred: torch.Tensor, y_true: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Poisson deviance（泊松偏差）：
+    2 * [ y*log(y/mu) - (y - mu) ]，定义 0*log(0) = 0。
+    """
+    y = y_true
+    mu = mu_pred.clamp_min(eps)
+    term = torch.zeros_like(mu)
+    mask = y > 0
+    term[mask] = y[mask] * (torch.log(y[mask] + eps) - torch.log(mu[mask]))
+    dev = 2.0 * (term - (y - mu))
+    return dev.mean()
+
+
+# 负二项 deviance 需要 theta
+def _loss_nb_dev(mu_pred: torch.Tensor, y_true: torch.Tensor, theta: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    NB deviance（负二项偏差）：
+    2 * [ y*log(y/mu) - (y + theta)*log((y+theta)/(mu+theta)) ].
+    """
+    y = y_true
+    mu = mu_pred.clamp_min(eps)
+    th = theta.unsqueeze(0).expand_as(mu).clamp_min(eps)
+    term1 = torch.zeros_like(mu)
+    mask = y > 0
+    term1[mask] = y[mask] * (torch.log(y[mask] + eps) - torch.log(mu[mask]))
+    term2 = (y + th) * (torch.log(y + th + eps) - torch.log(mu + th))
+    dev = 2.0 * (term1 - term2)
+    return dev.mean()
+
+
+LOSSES_NO_THETA: Dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = {
+    "MSE": _loss_mse,
+    "MSE_LOG1P": _loss_mse_log1p,
+    "MSE_ANS": _loss_mse_anscombe,
+    "POIS_DEV": _loss_pois_dev,  # 需要额外 eps，已内置缺省
+}
+
+# 需要 theta 的损失单独处理（例如 NB_DEV、NB_NLL）
+LOSSES_WITH_THETA: Dict[str, Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]] = {
+    "NB_DEV": _loss_nb_dev,
+}
+
+
+# -----------------------------
+# 模型定义
+# -----------------------------
+class LowRankNB_GLM(nn.Module):
+    """
+    低秩负二项 GLM（Low-Rank NB GLM）。
+
+    Parameters
+    ----------
+    gene_emb : torch.Tensor
+        基因嵌入矩阵 G，[n_g, d_g]。
+    pert_emb : torch.Tensor
+        扰动嵌入矩阵 P，[n_p, d_p]。
+    mu_control : torch.Tensor
+        控制组参考均值（reference mean）向量，[n_g]。
+    theta_per_gene : torch.Tensor
+        基因级离散度参数 θ_g，[n_g]。
+    use_cycle : bool
+        是否在 log-mean 中加入细胞周期（S/G2M）固定效应，G1 为基线。
+
+    Attributes
+    ----------
+    K : nn.Parameter
+        低秩核矩阵，[d_g, d_p]。
+    bias : nn.Parameter
+        基因级偏置项，[n_g]。
+    delta_log_mu_scaler : nn.Parameter
+        对 tanh 激活后的项统一缩放，标量。
+    beta_cycle : Optional[nn.Parameter]
+        周期项（S/G2M 两列）[n_g, 2]，仅当 use_cycle=True 时存在。
+    device : torch.device
+        模型所在设备（cuda/cpu），构造时自动选择。
+    """
+    def __init__(
+        self,
+        gene_emb: torch.Tensor,
+        pert_emb: torch.Tensor,
+        mu_control: torch.Tensor,
+        theta_per_gene: torch.Tensor,
+        use_cycle: bool = False
+    ):
+        super().__init__()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"[LowRankNB_GLM] 使用设备: {self.device}")
+
+        # 缓存常量到 device
+        self.G = gene_emb.to(self.device)                # [n_g, d_g]
+        self.P = pert_emb.to(self.device)                # [n_p, d_p]
+        self.mu_control = (mu_control + 1e-8).to(self.device)  # 避免 log(0)
+        self.theta = theta_per_gene.to(self.device)      # [n_g]
+        self.use_cycle = use_cycle
+
+        n_genes, d_g = self.G.shape
+        _, d_p = self.P.shape
+
+        # 可学习参数
+        self.K = nn.Parameter(torch.empty(d_g, d_p, device=self.device))
+        self.bias = nn.Parameter(torch.empty(n_genes, device=self.device))
+        self.delta_log_mu_scaler = nn.Parameter(torch.tensor(5.0, device=self.device))
+        if self.use_cycle:
+            self.beta_cycle = nn.Parameter(torch.zeros(n_genes, 2, device=self.device))  # (S, G2M)
+        else:
+            self.beta_cycle = None
+
+        # 初始化
+        nn.init.xavier_uniform_(self.K)
+        nn.init.zeros_(self.bias)
+
+    # -------------------------
+    # 前向：输出观测尺度的均值 μ（已加 offset）
+    # -------------------------
+    def forward(
+        self,
+        pert_ids: torch.LongTensor,                        # [B]
+        phase_ids: Optional[torch.LongTensor] = None,      # [B] in {0,1,2}
+        offset_log_s: Optional[torch.Tensor] = None        # [B]
+    ) -> torch.Tensor:
+        """
+        前向传播（Forward）。输出**观测尺度**的均值 `mu_pred`（非对数），形状 [B, n_g]。
+
+        公式（Formula）
+        --------------
+        设
+        $$
+        \\text{raw}_b = (G K P_{b}) + \\text{bias},\\quad
+        \\Delta_b = \\alpha \\cdot \\tanh(\\text{raw}_b),
+        $$
+        若 use_cycle=True，则
+        $$
+        \\text{cycle}_b = \\beta_{\\cdot,S}\\,\\mathbf{1}[\\phi_b=S] + \\beta_{\\cdot,G2M}\\,\\mathbf{1}[\\phi_b=G2M].
+        $$
+        则
+        $$
+        \\log \\mu_b = \\log \\mu^{\\mathrm{ctrl}} + \\Delta_b + \\text{cycle}_b + \\log s_b,
+        \\quad \\mu_b = \\exp(\\log \\mu_b).
+        $$
+
+        Returns
+        -------
+        torch.Tensor
+            [B, n_g] 的观测尺度均值（已 clamp 到 [1e-10, 1e7]）。
+        """
+        # 选择扰动嵌入并计算低秩项
+        P_sel = self.P[pert_ids]  # [B, d_p]
+        raw = (self.G @ self.K @ P_sel.T).T + self.bias.unsqueeze(0)  # [B, n_g]
+        delta_log_mu = self.delta_log_mu_scaler * torch.tanh(raw)     # [B, n_g]
+
+        # 周期项
+        if self.use_cycle and phase_ids is not None:
+            is_S = (phase_ids == 1).float().unsqueeze(1)   # [B, 1]
+            is_G2M = (phase_ids == 2).float().unsqueeze(1)
+            cycle_term = is_S @ self.beta_cycle[:, 0].unsqueeze(0) + is_G2M @ self.beta_cycle[:, 1].unsqueeze(0)
+            log_mu = torch.log(self.mu_control.unsqueeze(0)) + delta_log_mu + cycle_term
+        else:
+            log_mu = torch.log(self.mu_control.unsqueeze(0)) + delta_log_mu
+
+        # offset（size factor）
+        if offset_log_s is not None:
+            log_mu = log_mu + offset_log_s.unsqueeze(1)
+
+        mu_pred = torch.exp(log_mu)
+        return torch.clamp(mu_pred, min=1e-10, max=1e7)
+
+    # -------------------------
+    # 训练接口
+    # -------------------------
+    def fit(
+        self,
+        dataloader,
+        loss_type: str = "MSE",
+        learning_rate: float = 5e-4,
+        n_epochs: int = 100,
+        l1_lambda: float = 1e-4,
+        l2_lambda: float = 5e-3,
+        progress: bool = True
+    ) -> None:
+        """
+        统一训练循环（Unified training loop）。
+
+        dataloader 要求每个 batch 至少包含：
+          - 'pert' : LongTensor [B]
+          - 'y'    : FloatTensor [B, n_g]
+          - 'log_s': FloatTensor [B]
+          - （可选）'phase': LongTensor [B]（当 use_cycle=True）
+
+        Parameters
+        ----------
+        loss_type : str
+            取值之一：["MSE","NB","POIS_DEV","NB_DEV","MSE_LOG1P","MSE_ANS"]。
+            - "NB": 代表使用 NB 对数似然（negative binomial NLL）。
+            - "NB_DEV": 使用 NB 偏差（需要 theta）。
+        """
+        loss_type = loss_type.upper()
+        optimizer = optim.AdamW(self.parameters(), lr=learning_rate)
+
+        def loss_nb_nll(mu: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            """
+            负二项 NLL（允许 y 为实数，使用 Γ 的连续延拓）。
+            """
+            eps = 1e-8
+            theta = self.theta.unsqueeze(0)  # [1, n_g]
+            log_theta_mu = torch.log(theta + mu + eps)
+            ll = (
+                torch.lgamma(theta + y + eps)
+                - torch.lgamma(theta + eps)
+                - torch.lgamma(y + 1.0)
+                + theta * torch.log(theta + eps)
+                - theta * log_theta_mu
+                + y * torch.log(mu + eps)
+                - y * log_theta_mu
+            )
+            return -ll.mean()
+
+        # 选择损失
+        if loss_type == "NB":
+            loss_fn = loss_nb_nll
+            needs_theta = False
+        elif loss_type in LOSSES_NO_THETA:
+            loss_fn = LOSSES_NO_THETA[loss_type]
+            needs_theta = False
+        elif loss_type in LOSSES_WITH_THETA:
+            loss_fn_wt = LOSSES_WITH_THETA[loss_type]
+            needs_theta = True
+        else:
+            raise ValueError(f"[LowRankNB_GLM.fit] Unknown loss_type: {loss_type}")
+
+        loop = range(n_epochs)
+        if progress:
+            try:
+                from tqdm import tqdm
+                loop = tqdm(loop, desc=f"Training ({loss_type})")
+            except Exception:
+                pass
+
+        for _ in loop:
+            epoch_loss = 0.0
+            total_n = 0
+            for batch in dataloader:
+                pert = batch["pert"].to(self.device)
+                y_true = batch["y"].to(self.device)
+                log_s = batch["log_s"].to(self.device)
+                phase = batch.get("phase", None)
+                if phase is not None:
+                    phase = phase.to(self.device)
+
+                optimizer.zero_grad()
+                mu_pred = self.forward(pert, phase, offset_log_s=log_s)
+
+                if needs_theta:
+                    loss = loss_fn_wt(mu_pred, y_true, self.theta)
+                else:
+                    loss = loss_fn(mu_pred, y_true)
+
+                # 正则项（对 K）
+                reg = l1_lambda * self.K.abs().sum() + l2_lambda * (self.K ** 2).sum()
+                loss = loss + reg
+
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+                optimizer.step()
+
+                bs = y_true.size(0)
+                epoch_loss += loss.item() * bs
+                total_n += bs
+
+            if progress and total_n > 0:
+                avg_loss = epoch_loss / total_n
+                try:
+                    loop.set_postfix(loss=f"{avg_loss:.4f}")
+                except Exception:
+                    pass
+
+    # -------------------------
+    # 预测与采样接口
+    # -------------------------
+    @torch.no_grad()
+    def predict_and_sample(
+        self,
+        pert_ids_test: torch.LongTensor,
+        batch_size: int = 1024,
+        use_sf: bool = True,
+        sf_test: Optional[torch.Tensor] = None,      # [N_test]（若 use_sf=False 可为 None）
+        use_gamma: bool = True,
+        gamma_r0: float = 50.0,
+        sampler: str = "poisson",
+        use_cycle: bool = False,
+        phase_ids_test: Optional[torch.LongTensor] = None
+    ) -> torch.Tensor:
+        """
+        预测并采样（Predict & Sample）。
+
+        步骤（Steps）
+        ------------
+        1) 调用 forward 得到参考尺度 μ_ref 并加 offset 得到观测尺度 μ_obs。
+        2) 若启用 Gamma 异质性（*Gamma heterogeneity*），对每个 cell 采样 L ~ Gamma(r0, r0)，
+           并令 μ_obs ← μ_obs × L（均值保持不变，增加方差）。
+        3) 采样：
+           - Poisson：Y ~ Pois(μ_obs)
+           - NB（logits 参数化）：
+             logits = log(θ) - log(μ_obs)，total_count = θ
+
+        Returns
+        -------
+        torch.Tensor
+            采样得到的计数矩阵 [N_test, n_g]（在 CPU 上）。
+        """
+        sampler = sampler.lower()
+        assert sampler in ("poisson", "nb"), "sampler 必须为 'poisson' 或 'nb'"
+
+        self.eval()
+        outs = []
+        n = pert_ids_test.numel()
+        for i in range(0, n, batch_size):
+            sl = slice(i, min(i + batch_size, n))
+            pids = pert_ids_test[sl].to(self.device)
+
+            if use_cycle:
+                assert phase_ids_test is not None, "[predict_and_sample] use_cycle=True 需要提供 phase_ids_test"
+                ph = phase_ids_test[sl].to(self.device)
+            else:
+                ph = None
+
+            if use_sf:
+                assert sf_test is not None, "[predict_and_sample] use_sf=True 需要提供 sf_test"
+                sfb = sf_test[sl].to(self.device)
+                log_sfb = torch.log(sfb.clamp_min(1e-12))
+            else:
+                log_sfb = None
+
+            mu_obs = self.forward(pids, ph, offset_log_s=log_sfb)  # [B, n_g]
+
+            # Gamma 异质性（每 cell 一个缩放因子，均值=1，方差=1/r0）
+            if use_gamma:
+                r0 = torch.tensor(gamma_r0, device=self.device)
+                L = torch.distributions.Gamma(concentration=r0, rate=r0).sample((mu_obs.size(0),)).unsqueeze(1)
+                mu_obs = (mu_obs * L).clamp_min(1e-12)
+
+            if sampler == "poisson":
+                sampled = torch.distributions.Poisson(mu_obs).sample()
+            elif sampler == "nb":
+                theta_b = self.theta.unsqueeze(0)          # [1, n_g]
+                logits = torch.log(theta_b) - torch.log(mu_obs)  # logit(p) = log(θ) - log(μ)
+                logits = logits.clamp(min=-40.0, max=40.0)       # 数值稳定
+                nb = torch.distributions.NegativeBinomial(total_count=theta_b, logits=logits)
+                sampled = nb.sample()
+            else:
+                raise ValueError(f"[predict_and_sample] 未知 sampler: {sampler}")
+
+            outs.append(sampled.cpu())
+
+        return torch.cat(outs, dim=0)
+
+```
+
+--- FILE: src/nbglm/dataset.py ---
+```
+# src/nbglm/dataset.py
+# -*- coding: utf-8 -*-
+"""
+数据集与统计预处理（Datasets & Preprocessing Utilities）
+=====================================================
+
+本模块提供：
+- 将稀疏/稠密矩阵转为 torch.Tensor 的便捷函数
+- size factor（文库大小因子, *size factor*）估计与验证集重采样构造
+- 负二项分布（Negative Binomial, NB）离散度参数 theta 的矩估计（Method of Moments, MoM）
+- 细胞周期（cell cycle, phase）相关工具：标签映射、全局/分扰动相对频率、验证集 phase 采样策略
+- 训练数据集（WholeCellDataset）与伪批（pseudo-bulk）数据集（PseudoBulkDataset）
+- 在 CPU 上构建伪批（pseudobulk）的高效函数（避免 GPU OOM）
+
+数学记号（Mathematical Notation）
+--------------------------------
+- 令 $X \\in \\mathbb{N}^{N \\times G}$ 为计数矩阵（cells × genes）。
+- 文库深度（library size）$L_i = \\sum_{g=1}^G X_{ig}$。
+- size factor 定义为
+  $$
+  s_i \\;=\\; \\frac{L_i}{\\operatorname{median}(L)}.
+  $$
+  在 GLM 中以偏置项（offset, $\\log s_i$）加入：
+  $$
+  \\log \\mu_{ig}^{(\\mathrm{obs})} = \\log \\mu_{ig}^{(\\mathrm{ref})} + \\log s_i.
+  $$
+- NB 的 MoM 离散度估计：
+  $$
+  \\theta_g = \\frac{\\mu_g^2}{\\max(\\operatorname{Var}_g - \\mu_g, \\varepsilon)}.
+  $$
+
+依赖（Dependencies）
+-------------------
+- torch, numpy, pandas, anndata, tqdm
+"""
+
+from __future__ import annotations
+
+from typing import Dict, List, Optional, Tuple
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+from tqdm import tqdm
+import anndata as ad
+
+
+# -----------------------------
+# 常量与基础工具
+# -----------------------------
+PHASE2ID: Dict[str, int] = {"G1": 0, "S": 1, "G2M": 2}
+
+
+def to_tensor(X) -> torch.Tensor:
+    """
+    将稀疏/稠密矩阵转换为 float32 的 torch.Tensor（在 CPU 上）。
+
+    Parameters
+    ----------
+    X : scipy.sparse.spmatrix 或 numpy.ndarray 或 array-like
+        计数矩阵或任意矩阵。
+
+    Returns
+    -------
+    torch.Tensor
+        dtype=float32, device=CPU
+    """
+    if hasattr(X, "toarray"):
+        X = X.toarray()
+    return torch.tensor(X, dtype=torch.float32)
+
+
+# -----------------------------
+# size factor（文库大小因子）
+# -----------------------------
+def compute_size_factors(
+    X: torch.Tensor,
+    ref_depth: Optional[torch.Tensor] = None,
+    eps: float = 1e-8
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    计算 size factor（s_i）与参照深度（reference depth）。
+
+    定义（Definition）
+    -----------------
+    设第 i 个细胞的文库深度（UMI 总数）为 $L_i = \\sum_g X_{ig}$。
+    参照深度 $L_\\mathrm{ref} = \\operatorname{median}(L)$。
+    则 size factor：
+    $$
+    s_i = \\frac{L_i}{L_\\mathrm{ref}}.
+    $$
+
+    在 GLM 中（作为 offset）使用 $\\log s_i$，使模型输出的参考尺度均值
+    $\\mu^{(\\mathrm{ref})}$ 映射回观测尺度 $\\mu^{(\\mathrm{obs})}$。
+
+    Parameters
+    ----------
+    X : torch.Tensor
+        [N, G] 计数矩阵（CPU）。
+    ref_depth : Optional[torch.Tensor]
+        可选的外部参照深度；若为 None，则使用当前 X 的 median(L)。
+    eps : float
+        数值下限，用于避免除零。
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        (sf, ref_depth)
+        - sf: [N] 的 size factor
+        - ref_depth: 标量张量（median library size）
+    """
+    lib = X.sum(dim=1)
+    if ref_depth is None:
+        ref_depth = torch.median(lib)
+    sf = (lib / (ref_depth + eps)).clamp(min=eps)
+    return sf, ref_depth
+
+
+def build_validation_size_factors(
+    df_val: pd.DataFrame,
+    sf_ctrl: torch.Tensor,
+    ref_depth: torch.Tensor,
+    seed: int = 2025
+) -> torch.Tensor:
+    """
+    基于 control 的 sf 分布与验证集 `median_umi_per_cell` 约束，构造验证集 cells 的 size factor。
+
+    思路（Idea）
+    -----------
+    - 从 control sf 分布中**重采样**（resample）出与每个扰动所需细胞数相同的样本；
+    - 将该批样本的**中位数**缩放至 `target_med_sf = median_umi_per_cell / ref_depth`。
+
+    Parameters
+    ----------
+    df_val : pd.DataFrame
+        必含列：["target_gene", "n_cells", "median_umi_per_cell"]，行顺序决定输出顺序。
+    sf_ctrl : torch.Tensor
+        来自 control 细胞的 size factor（[N_ctrl]）。
+    ref_depth : torch.Tensor
+        参照深度（scalar tensor）。
+    seed : int
+        重采样随机种子。
+
+    Returns
+    -------
+    torch.Tensor
+        验证集 cells 的 size factor，长度 = sum(n_cells)。
+    """
+    rng = np.random.default_rng(seed)
+    sfc = sf_ctrl.detach().cpu().numpy()
+    out = []
+    for _, row in df_val.iterrows():
+        n = int(row["n_cells"])
+        med_umi = float(row["median_umi_per_cell"])
+        target_med_sf = med_umi / float(ref_depth.item())
+        idx = rng.integers(0, len(sfc), size=n)
+        samp = sfc[idx]
+        cur_med = np.median(samp) if np.median(samp) > 0 else 1.0
+        scaled = samp * (target_med_sf / cur_med)
+        out.append(torch.tensor(scaled, dtype=torch.float32))
+    return torch.cat(out, dim=0)
+
+
+# -----------------------------
+# NB 离散度参数 theta 的 MoM 估计
+# -----------------------------
+def estimate_theta_per_gene(X_ctrl: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    对每个基因估计 NB 离散度参数 θ（theta），采用矩估计（Method of Moments, MoM）。
+
+    公式（Formula）
+    --------------
+    对第 g 个基因，
+    $$
+    \\mu_g = \\operatorname{mean}(X_{\\cdot g}),\\quad
+    \\operatorname{Var}_g = \\operatorname{var}(X_{\\cdot g})
+    $$
+    在 NB 模型中 $\\operatorname{Var}(Y) = \\mu + \\mu^2/\\theta$，
+    故
+    $$
+    \\theta_g \\approx \\frac{\\mu_g^2}{\\max(\\operatorname{Var}_g - \\mu_g, \\varepsilon)}.
+    $$
+
+    当 $\\operatorname{Var}_g \\le \\mu_g$ 时，视为接近 Poisson（无过度离散），给出较大 θ。
+
+    Parameters
+    ----------
+    X_ctrl : torch.Tensor
+        控制组的计数或标准化计数（可先除以 size factor 后再估计），形状 [N_ctrl, G]。
+    eps : float
+        数值下限；避免除零与负方差导致的异常。
+
+    Returns
+    -------
+    torch.Tensor
+        [G] 的 θ 向量（clamp 到合理范围）。
+    """
+    mu_g = X_ctrl.mean(dim=0)
+    var_g = X_ctrl.var(dim=0, unbiased=False)
+    denominator = var_g - mu_g
+    theta_g = torch.full_like(mu_g, 1e6)  # 大值 ≈ Poisson
+    over_mask = denominator > eps
+    theta_g[over_mask] = (mu_g[over_mask] * mu_g[over_mask]) / denominator[over_mask]
+    theta_g = theta_g.clamp(min=1e-6, max=1e12)
+    return theta_g
+
+
+# -----------------------------
+# Phase（细胞周期）工具
+# -----------------------------
+def phases_to_ids(phases: List[str]) -> torch.LongTensor:
+    """
+    将字符串 phase（"G1"/"S"/"G2M"）映射为 ID（0/1/2）。
+
+    Returns
+    -------
+    torch.LongTensor
+        [N]，取值 ∈ {0,1,2}，未知按 G1 处理（0）。
+    """
+    return torch.tensor([PHASE2ID.get(p, 0) for p in phases], dtype=torch.long)
+
+
+def compute_global_phase_probs(phases: List[str]) -> np.ndarray:
+    """
+    计算全局 phase 频率分布（probabilities）。
+
+    Returns
+    -------
+    np.ndarray
+        形如 [p(G1), p(S), p(G2M)]。
+    """
+    counts = np.zeros(3, dtype=float)
+    for p in phases:
+        if p in PHASE2ID:
+            counts[PHASE2ID[p]] += 1
+    total = counts.sum()
+    if total <= 0:
+        return np.array([0.7, 0.15, 0.15], dtype=float)
+    return counts / total
+
+
+def compute_per_pert_phase_probs(adata_pert: ad.AnnData, pert_name_col: str) -> Dict[str, np.ndarray]:
+    """
+    计算**按扰动**的 phase 概率，用于 `phase_strategy="control"`。
+
+    Parameters
+    ----------
+    adata_pert : anndata.AnnData
+        含有训练集的扰动细胞。
+    pert_name_col : str
+        扰动列名（如 "target_gene"）。
+
+    Returns
+    -------
+    Dict[str, np.ndarray]
+        {pert_name: [pG1, pS, pG2M]}
+    """
+    df = adata_pert.obs[[pert_name_col, "phase"]].copy()
+    out: Dict[str, np.ndarray] = {}
+    for name, sub in df.groupby(pert_name_col):
+        out[name] = compute_global_phase_probs(sub["phase"].tolist())
+    return out
+
+
+def sample_validation_phases(
+    df_val: pd.DataFrame,
+    phase_strategy: str,
+    global_probs: np.ndarray,
+    per_pert_probs: Optional[Dict[str, np.ndarray]],
+    seed: int = 2025
+) -> List[int]:
+    """
+    为验证集**按策略**生成 phase 序列（与 df_val 展开顺序一致）。
+
+    策略（Strategies）
+    ------------------
+    - "ignore" / "fixed_G1": 全为 G1（基线）。
+    - "fixed_S": 全为 S。
+    - "fixed_G2M": 全为 G2M。
+    - "global": 按全局比例采样。
+    - "control": 若该扰动有训练期统计，则按其分布采样，否则退化为 global。
+
+    Returns
+    -------
+    List[int]
+        phase 的 ID 列表（0/1/2）。
+    """
+    rng = np.random.default_rng(seed)
+    out: List[int] = []
+    for _, row in df_val.iterrows():
+        pert = str(row["target_gene"])
+        n = int(row["n_cells"])
+        if phase_strategy in ("ignore", "fixed_G1"):
+            out.extend([PHASE2ID["G1"]] * n)
+        elif phase_strategy == "fixed_S":
+            out.extend([PHASE2ID["S"]] * n)
+        elif phase_strategy == "fixed_G2M":
+            out.extend([PHASE2ID["G2M"]] * n)
+        elif phase_strategy == "global":
+            out.extend(rng.choice([0, 1, 2], size=n, p=global_probs).tolist())
+        elif phase_strategy == "control":
+            probs = global_probs
+            if per_pert_probs is not None and pert in per_pert_probs:
+                probs = per_pert_probs[pert]
+            out.extend(rng.choice([0, 1, 2], size=n, p=probs).tolist())
+        else:
+            # 未知策略 ⇒ global
+            out.extend(rng.choice([0, 1, 2], size=n, p=global_probs).tolist())
+    return out
+
+
+# -----------------------------
+# Dataset 定义
+# -----------------------------
+class WholeCellDataset(Dataset):
+    """
+    基于**单细胞级**训练的 Dataset。
+
+    约定（Conventions）
+    -------------------
+    - 本数据集**不在内部改变**原始计数 `Y`；size factor 的影响通过 `log_s`（offset）提供给模型。
+    - 若 `use_cycle=True`，则需提供 `phase_ids`。
+
+    __getitem__ 返回字段（fields）
+    -----------------------------
+    - 'y'    : FloatTensor [G]
+    - 'pert' : LongTensor  []
+    - 'log_s': FloatTensor []
+    - 'phase': LongTensor  []（可选）
+    """
+    def __init__(
+        self,
+        X_tensor: torch.Tensor,                 # [N, G] CPU
+        pert_ids: torch.LongTensor,             # [N]
+        sf: Optional[torch.Tensor] = None,      # [N] 若 use_sf=False 可为 None
+        use_sf: bool = True,
+        use_cycle: bool = False,
+        phase_ids: Optional[torch.LongTensor] = None  # [N] ∈ {0,1,2}
+    ):
+        assert X_tensor.device.type == "cpu", "WholeCellDataset 仅支持 CPU 张量作为输入。"
+        assert pert_ids.device.type == "cpu"
+        self.Y = X_tensor
+
+        self.use_sf = use_sf
+        if use_sf:
+            assert sf is not None and sf.device.type == "cpu"
+            self.log_s = torch.log(sf.clamp_min(1e-12))
+        else:
+            self.log_s = torch.zeros(X_tensor.size(0), dtype=torch.float32)
+
+        self.pert_ids = pert_ids
+        self.use_cycle = use_cycle
+        if use_cycle:
+            assert phase_ids is not None and phase_ids.device.type == "cpu"
+        self.phase_ids = phase_ids
+
+    def __len__(self) -> int:
+        return self.Y.shape[0]
+
+    def __getitem__(self, idx: int):
+        item = {
+            "y": self.Y[idx],
+            "pert": self.pert_ids[idx],
+            "log_s": self.log_s[idx],
+        }
+        if self.use_cycle:
+            item["phase"] = self.phase_ids[idx]
+        return item
+
+
+class PseudoBulkDataset(Dataset):
+    """
+    基于**伪批（pseudo-bulk）**聚合的 Dataset。
+
+    模式（两种）
+    -----------
+    - 无周期：每个样本对应一个扰动的**平均表达** [G]。
+    - 有周期：每个样本对应 (扰动 × phase) 的**平均表达** [G]。
+
+    __getitem__ 返回字段（fields）
+    -----------------------------
+    - 'y'    : FloatTensor [G]
+    - 'pert' : LongTensor  []
+    - 'log_s': FloatTensor []（若未使用 size factor 则为 0）
+    - 'phase': LongTensor  []（仅在 use_cycle=True 时）
+    """
+    def __init__(
+        self,
+        Y_avg: torch.Tensor,                         # [K, G] 或 [B_eff, G]
+        pert_ids_eff: torch.LongTensor,              # 与 Y_avg 对齐
+        use_cycle: bool = False,
+        phase_ids_eff: Optional[torch.LongTensor] = None,
+        log_s_eff: Optional[torch.Tensor] = None
+    ):
+        assert Y_avg.device.type == "cpu"
+        assert pert_ids_eff.device.type == "cpu"
+        self.Y = Y_avg
+        self.pert_ids_eff = pert_ids_eff
+        self.use_cycle = use_cycle
+        if use_cycle:
+            assert phase_ids_eff is not None and phase_ids_eff.device.type == "cpu"
+        self.phase_ids_eff = phase_ids_eff
+        self.log_s = log_s_eff if log_s_eff is not None else torch.zeros(Y_avg.size(0), dtype=torch.float32)
+
+    def __len__(self) -> int:
+        return self.Y.shape[0]
+
+    def __getitem__(self, idx: int):
+        item = {"y": self.Y[idx], "pert": self.pert_ids_eff[idx], "log_s": self.log_s[idx]}
+        if self.use_cycle:
+            item["phase"] = self.phase_ids_eff[idx]
+        return item
+
+
+# -----------------------------
+# 伪批（pseudo-bulk）构建
+# -----------------------------
+@torch.no_grad()
+def build_pseudobulk(
+    X_pert_train: torch.Tensor,            # [N, G] CPU
+    pert_ids_train: torch.LongTensor,      # [N]    CPU（映射到 0..K-1 的扰动索引）
+    ref_depth: torch.Tensor,               # scalar tensor
+    use_sf: bool,
+    use_cycle: bool,
+    phase_ids_train: Optional[torch.LongTensor],  # [N] ∈ {0,1,2}，当 use_cycle=True 必须提供
+    batch_size: int = 4096
+) -> Tuple[torch.Tensor, torch.LongTensor, Optional[torch.LongTensor], Optional[torch.Tensor]]:
+    """
+    在 CPU 上构建伪批（避免 GPU OOM）。将每个扰动（或扰动×phase）的细胞表达**平均**到一条样本。
+
+    - 无周期时：
+      返回 (Y_avg[K,G], unique_perts[K], None, log_s[K])
+    - 有周期时：
+      返回 (Y_avg_flat[B_eff,G], pert_ids_eff[B_eff], phase_ids_eff[B_eff], log_s[B_eff])
+
+    size factor 的处理（作为 offset）：
+    ----------------------------------
+    对第 k 个聚合单元（扰动或扰动×phase），计算其平均文库深度
+    $\\bar{L}_k = \\frac{1}{n_k} \\sum_{i \\in \\mathcal{I}_k} L_i$，
+    并令
+    $$
+      s_k = \\frac{\\bar{L}_k}{L_\\mathrm{ref}},\\quad
+      \\log s_k = \\log(\\max(s_k, 10^{-12})).
+    $$
+    下游模型 forward 可将 `log_s` 当作 offset 直接加到 $\\log \\mu$ 上。
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.LongTensor, Optional[torch.LongTensor], Optional[torch.Tensor]]
+        (Y_avg, pert_ids_eff, phase_ids_eff, log_s_eff)
+    """
+    assert X_pert_train.device.type == "cpu"
+    assert pert_ids_train.device.type == "cpu"
+    if use_cycle:
+        assert phase_ids_train is not None and phase_ids_train.device.type == "cpu"
+
+    N, G = X_pert_train.shape
+    lib_all = X_pert_train.sum(dim=1)
+
+    unique_perts, inverse_indices = torch.unique(pert_ids_train, return_inverse=True)  # [K], [N]
+    K = unique_perts.numel()
+
+    if not use_cycle:
+        Y_sum = torch.zeros(K, G, dtype=torch.float32)
+        counts = torch.zeros(K, dtype=torch.long)
+        lib_sum = torch.zeros(K, dtype=torch.float32)
+
+        for start in tqdm(range(0, N, batch_size), desc="构建 pseudo-bulk (no phase, CPU)"):
+            end = min(start + batch_size, N)
+            Xb = X_pert_train[start:end]
+            invb = inverse_indices[start:end]
+            libb = lib_all[start:end].to(torch.float32)
+
+            Y_sum.index_add_(0, invb, Xb)
+            lib_sum.index_add_(0, invb, libb)
+            counts.index_add_(0, invb, torch.ones_like(invb, dtype=torch.long))
+
+        counts = counts.clamp_min(1)
+        Y_avg = Y_sum / counts.unsqueeze(1)
+
+        if use_sf:
+            mean_lib = lib_sum / counts.to(torch.float32)
+            s_eff = (mean_lib / ref_depth).clamp_min(1e-12)
+            log_s_eff = torch.log(s_eff)
+        else:
+            log_s_eff = None
+
+        return Y_avg, unique_perts, None, log_s_eff
+
+    else:
+        # 维度 [K, 3, G] 分别聚合 G1/S/G2M
+        Y_sum = torch.zeros(K, 3, G, dtype=torch.float32)
+        counts = torch.zeros(K, 3, dtype=torch.long)
+        lib_sum = torch.zeros(K, 3, dtype=torch.float32)
+
+        for start in tqdm(range(0, N, batch_size), desc="构建 pseudo-bulk by phase (CPU)"):
+            end = min(start + batch_size, N)
+            Xb = X_pert_train[start:end]
+            invb = inverse_indices[start:end]
+            phb = phase_ids_train[start:end]
+            libb = lib_all[start:end].to(torch.float32)
+
+            for ph in (0, 1, 2):
+                mask = (phb == ph)
+                if mask.any():
+                    idxp = invb[mask]
+                    Xsub = Xb[mask]
+                    lsub = libb[mask]
+                    Y_sum_phase = Y_sum[:, ph, :]
+                    Y_sum_phase.index_add_(0, idxp, Xsub)
+                    lib_sum[:, ph].index_add_(0, idxp, lsub)
+                    counts[:, ph].index_add_(0, idxp, torch.ones_like(idxp, dtype=torch.long))
+
+        counts = counts.clamp_min(1)
+        Y_avg = Y_sum / counts.unsqueeze(2)  # [K, 3, G]
+
+        # 摊平成有效条目
+        mask_flat = (counts > 0).reshape(-1)              # [K*3]
+        Y_flat = Y_avg.reshape(K * 3, G)
+        sel_idx = torch.nonzero(mask_flat, as_tuple=False).squeeze(1)
+
+        ks = torch.arange(K, dtype=torch.long).unsqueeze(1).repeat(1, 3).reshape(-1)  # [K*3]
+        phs = torch.tensor([0, 1, 2], dtype=torch.long).repeat(K)                     # [K*3]
+
+        pert_ids_eff = ks.index_select(0, sel_idx)   # 相对 unique_perts 的索引
+        phase_ids_eff = phs.index_select(0, sel_idx)
+        Y_avg_flat = Y_flat.index_select(0, sel_idx)
+
+        if use_sf:
+            lib_flat = lib_sum.reshape(K * 3)
+            cnt_flat = counts.reshape(K * 3).to(torch.float32)
+            mean_lib_flat = (lib_flat / cnt_flat.clamp_min(1.0)).index_select(0, sel_idx)
+            s_eff = (mean_lib_flat / ref_depth).clamp_min(1e-12)
+            log_s_eff = torch.log(s_eff)
+        else:
+            log_s_eff = None
+
+        return Y_avg_flat, unique_perts[pert_ids_eff], phase_ids_eff, log_s_eff
+
+```
+
+--- FILE: src/nbglm/pipelines.py ---
+```
+# src/nbglm/pipelines.py
+# -*- coding: utf-8 -*-
+"""
+训练 / 采样 / 评估 的流水线（Pipelines）
+======================================
+
+此模块把各个功能模块（data_io / dataset / model / eval）进行**编排**，提供简洁的上层接口：
+- run_train(cfg, run_dirs)             -> {"model":..., "meta":..., "ckpt_path":...}
+- run_sample(cfg, run_dirs, ...)       -> {"pred_adata_path": 或 "pred_adata": AnnData}
+- run_evaluate(cfg, run_dirs, ...)     -> {"metrics": {...}}
+- 组合模式：run_train_sample_eval / run_train_sample / run_sample_eval / run_sample / run_evaluate_only
+
+设计要点（Design Notes）
+-----------------------
+- **内存直连**：由 cfg.pipeline.persist_intermediate 控制；false 时，采样产物不落盘，直接传递给评估函数。
+- **幂等产物**：若持久化，则统一落在 `run_dirs` 指定的结构下（ckpt/preds/metrics）。
+- **容错**：该层只做编排，不做重度逻辑；细节在下层模块中实现。
+"""
+
+from __future__ import annotations
+
+from typing import Dict, Optional, Tuple, Union, Any, List
+import os
+import json
+import time
+
+import numpy as np
+import pandas as pd
+import anndata as ad
+import torch
+from torch.utils.data import DataLoader
+
+from . import data_io
+from . import dataset as dset
+from . import model as mdl
+from . import eval as ev
+from .utils import set_seed, get_device, get_logger, ensure_dir
+
+
+# -----------------------------
+# 内部小工具
+# -----------------------------
+def _choose_train_h5ad(cfg: dict) -> str:
+    paths = cfg.get("paths", {})
+    data_cfg = cfg.get("data", {})
+    if data_cfg.get("use_split", True):
+        return paths.get("train_split_h5ad", paths.get("train_h5ad"))
+    return paths.get("train_h5ad")
+
+
+def _load_training_artifacts(cfg: dict) -> Tuple[ad.AnnData, ad.AnnData, str]:
+    """
+    读取训练期 h5ad，并分出 control / pert 两个子集。
+    返回：(adata_all, adata_pert, pert_col_name)
+    """
+    pert_col = cfg["data"]["pert_name_col"]
+    control_name = cfg["data"]["control_name"]
+    h5ad_path = _choose_train_h5ad(cfg)
+    adata_all = data_io.read_h5ad(h5ad_path)
+    if pert_col not in adata_all.obs.columns:
+        raise KeyError(f"[pipelines] 训练数据缺少列 '{pert_col}'")
+    adata_pert = adata_all[adata_all.obs[pert_col] != control_name].copy()
+    return adata_all, adata_pert, pert_col
+
+
+def _prepare_embeddings_and_maps(cfg: dict, adata_all: ad.AnnData, df_val: pd.DataFrame) -> Dict[str, Any]:
+    """
+    构造有序的 gene / pert 名称列表，加载并对齐 embeddings，返回必要的映射。
+    """
+    pert_col = cfg["data"]["pert_name_col"]
+    control_name = cfg["data"]["control_name"]
+
+    gene_names = adata_all.var_names.tolist()
+    train_perts = set(adata_all.obs[pert_col].unique())
+    val_perts = set(df_val[pert_col].tolist()) if pert_col in df_val.columns else set(df_val["target_gene"].tolist())
+    all_perts = sorted(train_perts | val_perts)
+
+    # 控制组置前
+    perts_ordered, pert2id = data_io.make_index_with_control_first(all_perts, control_name)
+
+    # 加载嵌入并 L2 normalize
+    G, P = data_io.load_embeddings(
+        cfg["paths"]["gene_embedding_csv"],
+        cfg["paths"]["pert_embedding_csv"],
+        gene_names,
+        perts_ordered,
+        l2_normalize=True,
+    )
+    return {
+        "gene_names": gene_names,
+        "perts_ordered": perts_ordered,
+        "pert2id": pert2id,
+        "G": G,
+        "P": P,
+    }
+
+
+def _build_training_dataloader(cfg: dict, adata_all: ad.AnnData, adata_pert: ad.AnnData, pert2id: Dict[str, int]) -> Tuple[DataLoader, Dict[str, Any]]:
+    """
+    根据 cfg.train.fit_mode 选择 WholeCell / PseudoBulk 的 DataLoader。
+    并返回训练需要的 meta（ref_depth / sf_ctrl 等）。
+    """
+    pert_col = cfg["data"]["pert_name_col"]
+    control_name = cfg["data"]["control_name"]
+
+    # tensors
+    X_pert = dset.to_tensor(adata_pert.X)          # [N, G] CPU
+    X_ctrl = dset.to_tensor(adata_all[adata_all.obs[pert_col] == control_name].X)  # [N_ctrl, G]
+
+    # size factor
+    use_sf = bool(cfg.get("size_factor", {}).get("use_sf", True))
+    sf_ctrl, ref_depth = dset.compute_size_factors(X_ctrl)
+    sf_pert, _ = dset.compute_size_factors(X_pert, ref_depth)
+
+    # mu_control & theta
+
+    mu_control = X_ctrl.mean(dim=0)
+    theta_vec = dset.estimate_theta_per_gene(X_ctrl)
+
+    # phase
+    use_cycle = bool(cfg.get("model", {}).get("use_cycle", False))
+    if use_cycle:
+        phase_col = cfg["data"].get("phase_column", "phase")
+        if phase_col not in adata_pert.obs.columns:
+            raise KeyError(f"[pipelines] use_cycle=True 但训练数据缺少列 '{phase_col}'")
+        phase_ids_train = dset.phases_to_ids(adata_pert.obs[phase_col].tolist())
+    else:
+        phase_ids_train = None
+
+    # pert ids
+    pert_ids_train = torch.tensor([pert2id[p] for p in adata_pert.obs[pert_col].tolist()], dtype=torch.long)
+
+    # dataloader
+    bs = int(cfg["train"].get("batch_size", 2048))
+    fit_mode = cfg["train"].get("fit_mode", "concise").lower()
+
+    if fit_mode == "whole":
+        ds = dset.WholeCellDataset(
+            X_tensor=X_pert,
+            pert_ids=pert_ids_train,
+            sf=(sf_pert if use_sf else None),
+            use_sf=use_sf,
+            use_cycle=use_cycle,
+            phase_ids=phase_ids_train,
+        )
+        loader = DataLoader(ds, batch_size=max(1, bs // 2), shuffle=True, drop_last=False)
+    elif fit_mode == "concise":
+        Y_avg, unique_perts_eff, phase_ids_eff, log_s_eff = dset.build_pseudobulk(
+            X_pert_train=X_pert,
+            pert_ids_train=pert_ids_train,
+            ref_depth=ref_depth,
+            use_sf=use_sf,
+            use_cycle=use_cycle,
+            phase_ids_train=phase_ids_train,
+            batch_size=bs * 2,
+        )
+        ds = dset.PseudoBulkDataset(
+            Y_avg=Y_avg,
+            pert_ids_eff=unique_perts_eff,
+            use_cycle=use_cycle,
+            phase_ids_eff=phase_ids_eff,
+            log_s_eff=log_s_eff,
+        )
+        loader = DataLoader(ds, batch_size=max(1, bs // 2), shuffle=True, drop_last=False)
+    else:
+        raise ValueError(f"[pipelines] 未知 fit_mode: {fit_mode}")
+
+    meta = {
+        "use_sf": use_sf,
+        "use_cycle": use_cycle,
+        "ref_depth": ref_depth,     # scalar tensor
+        "sf_ctrl": sf_ctrl,         # [N_ctrl]
+        "mu_control": mu_control,   # [G]
+        "theta_vec": theta_vec,     # [G]
+    }
+    return loader, meta
+
+
+def _instantiate_model(cfg: dict, G: torch.Tensor, P: torch.Tensor, mu_control: torch.Tensor, theta_vec: torch.Tensor) -> mdl.LowRankNB_GLM:
+    use_cycle = bool(cfg.get("model", {}).get("use_cycle", False))
+    net = mdl.LowRankNB_GLM(
+        gene_emb=G,
+        pert_emb=P,
+        mu_control=mu_control,
+        theta_per_gene=theta_vec,
+        use_cycle=use_cycle,
+    )
+    return net
+
+
+# -----------------------------
+# 训练
+# -----------------------------
+def run_train(cfg: dict, run_dirs: Dict[str, str]) -> Dict[str, Any]:
+    """
+    训练一次模型；若 cfg.pipeline.persist_intermediate=True，将保存 ckpt 到 ckpt_dir。
+
+    Returns
+    -------
+    Dict[str, Any]
+        { "model": model_instance, "meta": {...}, "ckpt_path": Optional[str] }
+    """
+    set_seed(int(cfg["experiment"].get("seed", 2025)))
+
+    # 读取训练数据与验证列表
+    adata_all, adata_pert, pert_col = _load_training_artifacts(cfg)
+    df_val = pd.read_csv(cfg["paths"]["val_list_csv"])
+
+    # 嵌入与映射
+    emb = _prepare_embeddings_and_maps(cfg, adata_all, df_val)
+    G, P = emb["G"], emb["P"]
+
+    # dataloader + 统计量
+    loader, meta = _build_training_dataloader(cfg, adata_all, adata_pert, emb["pert2id"])
+
+    # 模型与训练
+    model = _instantiate_model(cfg, G, P, meta["mu_control"], meta["theta_vec"])
+    loss_name = cfg["model"]["losses"]["primary"]
+    model.fit(
+        dataloader=loader,
+        loss_type=loss_name,
+        learning_rate=float(cfg["train"].get("lr", 5e-4)),
+        n_epochs=int(cfg["train"].get("epochs", 100)),
+        l1_lambda=float(cfg["model"]["regularization"].get("l1", 1e-4)),
+        l2_lambda=float(cfg["model"]["regularization"].get("l2", 5e-3)),
+        progress=True,
+    )
+
+    # 可选：保存 ckpt（包含必要常量，保证采样期无需再读 embeddings）
+    ckpt_path = None
+    if bool(cfg["pipeline"].get("persist_intermediate", True)):
+        ckpt_path = os.path.join(run_dirs["ckpt_dir"], "model.pt")
+        os.makedirs(run_dirs["ckpt_dir"], exist_ok=True)
+        torch.save({
+            "state_dict": model.state_dict(),
+            "G": G.cpu(),
+            "P": P.cpu(),
+            "mu_control": meta["mu_control"].cpu(),
+            "theta_vec": meta["theta_vec"].cpu(),
+            "use_cycle": bool(cfg["model"].get("use_cycle", False)),
+            "gene_names": emb["gene_names"],
+            "pert_names": emb["perts_ordered"],
+            "cfg": cfg,
+        }, ckpt_path)
+        print(f"[pipelines] 已保存模型到: {ckpt_path}")
+
+    # 返回对象与元信息
+    ret = {
+        "model": model,
+        "meta": {
+            **meta,
+            **emb,
+            "pert_col": pert_col,
+            "control_name": cfg["data"]["control_name"],
+            "train_h5ad_path": _choose_train_h5ad(cfg),
+        },
+        "ckpt_path": ckpt_path,
+    }
+    return ret
+
+
+# -----------------------------
+# 采样
+# -----------------------------
+def _load_model_from_ckpt(ckpt_path: str) -> mdl.LowRankNB_GLM:
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    net = mdl.LowRankNB_GLM(
+        gene_emb=ckpt["G"],
+        pert_emb=ckpt["P"],
+        mu_control=ckpt["mu_control"],
+        theta_per_gene=ckpt["theta_vec"],
+        use_cycle=bool(ckpt.get("use_cycle", False)),
+    )
+    net.load_state_dict(ckpt["state_dict"])
+    return net
+
+
+def run_sample(
+    cfg: dict,
+    run_dirs: Dict[str, str],
+    model: Optional[mdl.LowRankNB_GLM] = None,
+    meta: Optional[Dict[str, Any]] = None,
+    ckpt_path: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    进行一次采样推理（prediction + sampling）。
+    - 若提供 `model` 与 `meta`，将直接使用内存对象；
+    - 否则将从 `ckpt_path` 载入。
+
+    Returns
+    -------
+    Dict[str, Any]
+        - 若 persist_intermediate=True:
+            { "pred_adata_path": str }
+          否则：
+            { "pred_adata": anndata.AnnData }
+    """
+    # 加载模型 & 元信息
+    if model is None or meta is None:
+        if not ckpt_path:
+            # 允许从 cfg.pipeline.pretrained_ckpt 提供
+            ckpt_path = cfg.get("pipeline", {}).get("pretrained_ckpt", None)
+        if not ckpt_path or not os.path.exists(ckpt_path):
+            raise FileNotFoundError("[pipelines] 缺少 ckpt_path 或文件不存在；请设置 pipeline.pretrained_ckpt")
+        model = _load_model_from_ckpt(ckpt_path)
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        meta = {
+            "gene_names": ckpt["gene_names"],
+            "perts_ordered": ckpt["pert_names"],
+            "pert2id": {n: i for i, n in enumerate(ckpt["pert_names"])},
+            "use_cycle": bool(ckpt.get("use_cycle", False)),
+            "control_name": cfg["data"]["control_name"],
+            "pert_col": cfg["data"]["pert_name_col"],
+            "train_h5ad_path": _choose_train_h5ad(cfg),
+        }
+
+    # 读取验证列表 & 训练数据（用于 sf 与 phase 统计）
+    df_val = pd.read_csv(cfg["paths"]["val_list_csv"])
+    adata_all = data_io.read_h5ad(meta["train_h5ad_path"])
+    pert_col = meta["pert_col"]
+    control_name = meta["control_name"]
+    adata_ctrl = adata_all[adata_all.obs[pert_col] == control_name].copy()
+    adata_pert = adata_all[adata_all.obs[pert_col] != control_name].copy()
+
+    # 构造测试 pert id 列表
+    if pert_col in df_val.columns:
+        val_names = df_val[pert_col].tolist()
+        n_cells = df_val["n_cells"].tolist()
+    else:
+        # 兼容列名 "target_gene"
+        val_names = df_val["target_gene"].tolist()
+        n_cells = df_val["n_cells"].tolist()
+
+    pert_ids_test_list: List[int] = []
+    for name, n in zip(val_names, n_cells):
+        if name not in meta["pert2id"]:
+            raise KeyError(f"[pipelines] 验证集扰动 '{name}' 不在训练映射中！")
+        pert_ids_test_list.extend([meta["pert2id"][name]] * int(n))
+    pert_ids_test = torch.tensor(pert_ids_test_list, dtype=torch.long)
+
+    # size factor：根据 control 分布 + df_val 的 median_umi 构造
+    use_sf = bool(cfg.get("size_factor", {}).get("use_sf", True))
+    if use_sf:
+        X_ctrl = dset.to_tensor(adata_ctrl.X)
+        sf_ctrl, ref_depth = dset.compute_size_factors(X_ctrl)  # 重新估计（与训练一致）
+        sf_test = dset.build_validation_size_factors(df_val, sf_ctrl, ref_depth, seed=int(cfg["experiment"].get("seed", 2025)))
+    else:
+        sf_test = None
+
+    # phase：按策略生成
+    use_cycle = bool(cfg.get("model", {}).get("use_cycle", False))
+    if use_cycle:
+        phase_strategy = cfg["sampling"].get("phase_strategy", "global")
+        phase_col = cfg["data"].get("phase_column", "phase")
+        if phase_col in adata_all.obs.columns:
+            global_probs = dset.compute_global_phase_probs(adata_all.obs[phase_col].tolist())
+        else:
+            global_probs = np.array([0.7, 0.15, 0.15], dtype=float)
+        per_pert_probs = dset.compute_per_pert_phase_probs(adata_pert, pert_col) if phase_strategy == "control" else None
+        phase_ids_list = dset.sample_validation_phases(df_val, phase_strategy, global_probs, per_pert_probs, seed=int(cfg["experiment"].get("seed", 2025)))
+        phase_ids_test = torch.tensor(phase_ids_list, dtype=torch.long)
+    else:
+        phase_ids_test = None
+
+    # 采样参数
+    sp = cfg.get("sampling", {})
+    sampled_counts = model.predict_and_sample(
+        pert_ids_test=pert_ids_test,
+        batch_size=int(sp.get("batch_size", 4096)),
+        use_sf=use_sf,
+        sf_test=sf_test,
+        use_gamma=bool(sp.get("gamma_heterogeneity", {}).get("enable", True)),
+        gamma_r0=float(sp.get("gamma_heterogeneity", {}).get("r0", 50.0)),
+        sampler=str(sp.get("sampler", "poisson")),
+        use_cycle=use_cycle,
+        phase_ids_test=phase_ids_test,
+    )
+    sampled_counts = sampled_counts.cpu().numpy().astype(np.float32)
+
+    # 组装 AnnData：与训练 var 对齐，并**附带 control 细胞**以便评估（与历史评估兼容）
+    obs_pred = pd.DataFrame({pert_col: [meta["perts_ordered"][i] for i in pert_ids_test_list]})
+    if use_cycle and phase_ids_test is not None:
+        inv_map = {0: "G1", 1: "S", 2: "G2M"}
+        obs_pred["phase"] = [inv_map.get(int(x), "G1") for x in phase_ids_test.tolist()]
+    # 预测集
+    ad_pred = ad.AnnData(X=sampled_counts, obs=obs_pred, var=pd.DataFrame(index=meta["gene_names"]).copy())
+    # control 原样附带（只用于评估一致性；如不需要可删掉这一 concat）
+    ad_ctrl = adata_ctrl[:, meta["gene_names"]].copy()
+    ad_final = ad.concat([ad_ctrl, ad_pred], join="outer", index_unique=None)
+    ad_final.X = ad_final.X.astype(np.float32)
+
+    # 落盘 or 内存直连
+    if bool(cfg["pipeline"].get("persist_intermediate", True)):
+        out_path = os.path.join(run_dirs["pred_dir"], "pred.h5ad")
+        ad_final.write(out_path)
+        print(f"[pipelines] 已保存预测到: {out_path}")
+        return {"pred_adata_path": out_path}
+    else:
+        return {"pred_adata": ad_final}
+
+
+# -----------------------------
+# 评估
+# -----------------------------
+def run_evaluate(cfg: dict, run_dirs: Dict[str, str], pred_adata_or_path: Union[str, ad.AnnData]) -> Dict[str, Any]:
+    """
+    调用统一评估入口，返回并保存 metrics。
+    """
+    ev_cfg = cfg.get("evaluate", {})
+    if not bool(ev_cfg.get("enable", True)):
+        print("[pipelines] 评估被禁用（evaluate.enable=false）。")
+        return {"metrics": {}}
+
+    metrics = list(ev_cfg.get("metrics", ["MAE", "PDS", "DES"]))
+    true_h5ad = cfg["paths"]["test_h5ad"]
+    pert_col = cfg["data"]["pert_name_col"]
+    control_name = cfg["data"]["control_name"]
+    n_jobs = ev_cfg.get("n_jobs", "auto")
+
+    res = ev.evaluate(
+        pred_adata_or_path=pred_adata_or_path,
+        true_adata_or_path=true_h5ad,
+        pert_col=pert_col,
+        control_name=control_name,
+        metrics=metrics,
+        run_dir=run_dirs["run_dir"],
+        n_jobs=n_jobs,
+        normalize=True,
+        save_json=True,
+    )
+    return {"metrics": res}
+
+
+# -----------------------------
+# 组合模式
+# -----------------------------
+def run_train_sample_eval(cfg: dict, run_dirs: Dict[str, str]) -> Dict[str, Any]:
+    t = run_train(cfg, run_dirs)
+    s = run_sample(cfg, run_dirs, model=t["model"], meta=t["meta"])
+    p = s["pred_adata_path"] if "pred_adata_path" in s else s["pred_adata"]
+    e = run_evaluate(cfg, run_dirs, pred_adata_or_path=p)
+    return {"ckpt_path": t["ckpt_path"], **s, **e}
+
+
+def run_train_sample(cfg: dict, run_dirs: Dict[str, str]) -> Dict[str, Any]:
+    t = run_train(cfg, run_dirs)
+    s = run_sample(cfg, run_dirs, model=t["model"], meta=t["meta"])
+    return {"ckpt_path": t["ckpt_path"], **s}
+
+
+def run_sample_eval(cfg: dict, run_dirs: Dict[str, str]) -> Dict[str, Any]:
+    s = run_sample(cfg, run_dirs, model=None, meta=None, ckpt_path=cfg.get("pipeline", {}).get("pretrained_ckpt"))
+    p = s["pred_adata_path"] if "pred_adata_path" in s else s["pred_adata"]
+    e = run_evaluate(cfg, run_dirs, pred_adata_or_path=p)
+    return {**s, **e}
+
+
+def run_sample_only(cfg: dict, run_dirs: Dict[str, str]) -> Dict[str, Any]:
+    return run_sample(cfg, run_dirs, model=None, meta=None, ckpt_path=cfg.get("pipeline", {}).get("pretrained_ckpt"))
+
+
+def run_evaluate_only(cfg: dict, run_dirs: Dict[str, str]) -> Dict[str, Any]:
+    # 支持从 cfg.paths.pred_h5ad 读取预测文件
+    pred_path = cfg.get("paths", {}).get("pred_h5ad", None)
+    if not pred_path or not os.path.exists(pred_path):
+        raise FileNotFoundError("[pipelines] evaluate_only 模式需要提供 paths.pred_h5ad")
+    return run_evaluate(cfg, run_dirs, pred_adata_or_path=pred_path)
+
+```
+
+--- FILE: src/nbglm/eval.py ---
+```
+# src/nbglm/eval.py
+# -*- coding: utf-8 -*-
+"""
+评估指标（Evaluation Metrics）与统一评估入口
+==========================================
+
+提供三个指标：
+- MAE（Mean Absolute Error, 平均绝对误差）
+- PDS（Perturbation Distinguishability Score, 扰动区分分数）
+- DES（Differential Expression Score, 差异表达分数）
+
+评估流程（Overview）
+-------------------
+1) 读入预测 AnnData（pred_adata）与真实 AnnData（true_adata）。
+2) （如需）做标准化与 log1p（Normalization + log1p）。
+3) 计算基于**扰动均值表达**（mean profiles）的 MAE 与 PDS。
+4) 使用 Scanpy 的 `rank_genes_groups` 计算 DE 基因，对比真实 DE（可缓存）得到 DES。
+5) 汇总并保存 `metrics.json`（可在 `pipelines.py` 调用）。
+
+数学（MAE 与 PDS）
+------------------
+- 令 $\\bar{x}^{\\text{pred}}_g(p)$ 为预测中扰动 $p$ 的基因 $g$ 的**平均表达**；
+  $\\bar{x}^{\\text{true}}_g(p)$ 为真实数据对应的平均表达。
+  则
+  $$
+  \\mathrm{MAE}
+  = \\frac{1}{|\\mathcal{P}|}\\sum_{p\\in\\mathcal{P}}\\left(
+    \\frac{1}{G}\\sum_{g=1}^G\\big|\\bar{x}^{\\text{pred}}_g(p)-\\bar{x}^{\\text{true}}_g(p)\\big|
+  \\right).
+  $$
+
+- PDS 直观目标是：对每个扰动 $p$，以**L1 距离（cityblock）**在预测与真实的扰动均值空间中检索最相近的真实扰动，
+  并看**真值扰动**的排名是否靠前。我们使用
+  $$
+  \\mathrm{PDS} = \\frac{1}{|\\mathcal{P}|}\\sum_{p\\in\\mathcal{P}} \\left( 1 - \\frac{\\operatorname{rank}(p)-1}{|\\mathcal{P}|} \\right) .
+  $$
+
+依赖（Dependencies）
+-------------------
+- anndata, numpy, pandas, scanpy (sc), scipy, joblib, tqdm
+- 本模块只做**评估**，不涉及训练或采样。
+"""
+
+from __future__ import annotations
+
+from typing import Dict, List, Optional, Union
+import os
+import json
+import warnings
+import numpy as np
+import pandas as pd
+import anndata as ad
+import scanpy as sc
+from scipy.spatial.distance import cdist
+from joblib import Parallel, delayed
+from tqdm import tqdm
+
+from .utils import json_dump
+
+
+# -----------------------------
+# 标准化辅助
+# -----------------------------
+def _normalize_if_needed(adata: ad.AnnData, label: str, verbose: bool = True) -> ad.AnnData:
+    """
+    如需则进行 total-count normalize + log1p。
+    这里采取“总是做一次”的保守策略，以避免输入是原始计数时的量纲不匹配。
+
+    Parameters
+    ----------
+    adata : anndata.AnnData
+    label : str
+        日志标签（"预测"/"真实"）。
+    verbose : bool
+
+    Returns
+    -------
+    anndata.AnnData
+        归一化后的数据（原地修改的 copy）。
+    """
+    adata = adata.copy()
+    if verbose:
+        print(f"[eval] 对 '{label}' 数据执行 normalize_total + log1p ...")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        sc.pp.normalize_total(adata, target_sum=5e4)
+        sc.pp.log1p(adata)
+    return adata
+
+
+# -----------------------------
+# 均值表达（mean profiles）
+# -----------------------------
+def _mean_profiles(adata: ad.AnnData, pert_col: str, control_name: str, genes: Optional[List[str]] = None) -> pd.DataFrame:
+    """
+    计算每个扰动（以及 control）的**基因均值表达**，[num_perts, G] 的 DataFrame。
+
+    Returns
+    -------
+    pd.DataFrame
+        index: perturbation name；columns: gene symbols（与输入 genes 对齐）
+    """
+    if genes is None:
+        genes = list(adata.var_names)
+    profiles = {}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        # control
+        ctrl = adata[adata.obs[pert_col] == control_name]
+        profiles[control_name] = np.asarray(ctrl.X.mean(axis=0)).reshape(-1)
+        # perts
+        for p in sorted(set(adata.obs[pert_col]) - {control_name}):
+            sub = adata[adata.obs[pert_col] == p]
+            profiles[p] = np.asarray(sub.X.mean(axis=0)).reshape(-1)
+    df = pd.DataFrame(profiles, index=genes).T
+    return df
+
+
+# -----------------------------
+# 指标：MAE / PDS
+# -----------------------------
+def mae_score(pred_profiles: pd.DataFrame, true_profiles: pd.DataFrame, pert_list: List[str]) -> float:
+    vals = []
+    for p in pert_list:
+        if p in pred_profiles.index and p in true_profiles.index:
+            vals.append(np.mean(np.abs(pred_profiles.loc[p].values - true_profiles.loc[p].values)))
+    return float(np.mean(vals)) if vals else 0.0
+
+
+def pds_score(pred_profiles: pd.DataFrame, true_profiles: pd.DataFrame, pert_list: List[str]) -> float:
+    """
+    使用 L1 距离矩阵并计算“真值扰动的检索名次”得分。
+    """
+    if not pert_list:
+        return 0.0
+    pred_pert = pred_profiles.loc[pert_list]
+    true_pert = true_profiles.loc[pert_list]
+    dist = cdist(pred_pert.values, true_pert.values, metric="cityblock")
+    dist_df = pd.DataFrame(dist, index=pert_list, columns=pert_list)
+    scores = []
+    for p in pert_list:
+        rank = np.where(dist_df.loc[p].sort_values().index == p)[0][0] + 1  # 1-based
+        N = len(pert_list)
+        scores.append(1.0 - (rank - 1) / N)
+    return float(np.mean(scores)) if scores else 0.0
+
+
+# -----------------------------
+# DES（差异表达）
+# -----------------------------
+def _de_genes(adata_slice: ad.AnnData, pert_gene: str, pert_col: str, control_name: str) -> pd.DataFrame:
+    """
+    对指定扰动（与 control）计算 DE 基因，使用 `scanpy.tl.rank_genes_groups(..., method="wilcoxon")`。
+
+    Returns
+    -------
+    pd.DataFrame
+        包含列 ['names', 'pvals_adj', 'logfoldchanges']，已过滤 pvals_adj 无效项。
+    """
+    adata_local = adata_slice.copy()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        sc.tl.rank_genes_groups(
+            adata_local,
+            groupby=pert_col,
+            groups=[pert_gene],
+            reference=control_name,
+            method="wilcoxon",
+            use_raw=False,
+            n_genes=adata_local.shape[1],
+        )
+        res = adata_local.uns["rank_genes_groups"]
+        de_df = pd.DataFrame({
+            "names": res["names"][pert_gene],
+            "pvals_adj": res["pvals_adj"][pert_gene],
+            "logfoldchanges": res["logfoldchanges"][pert_gene],
+        })
+    de_df = de_df.replace([np.inf, -np.inf], np.nan).dropna()
+    return de_df
+
+
+def _true_de_cache_path(run_dir: str) -> str:
+    return os.path.join(run_dir, "metrics", "true_de_cache.pkl")
+
+
+def des_score(
+    pred_adata: ad.AnnData,
+    true_adata: ad.AnnData,
+    pert_col: str,
+    control_name: str,
+    n_jobs: int,
+    cache_dir: Optional[str] = None
+) -> float:
+    """
+    DES 计算流程：
+    1) 为**真实数据**缓存每个扰动的 DE 基因集合（p_adj<0.05）。
+    2) 对**预测数据**，对每个扰动计算 DE 集合，并与真实集合做**交集占比**。
+    3) 求各扰动的平均值。
+
+    为提升稳定性，当真实 DE 数量为 0 时，返回 1.0（视为无可区分差异）。
+
+    Parameters
+    ----------
+    n_jobs : int
+        并行核数（<=0 则退化为 1；"auto" 已在外部解析为合理整数）。
+    """
+    if n_jobs <= 0:
+        n_jobs = 1
+
+    pert_list = sorted([p for p in set(true_adata.obs[pert_col]) if p != control_name])
+    # --- 1) 真值 DE 缓存 ---
+    cache_path = None if cache_dir is None else _true_de_cache_path(cache_dir)
+    if cache_path and os.path.exists(cache_path):
+        with open(cache_path, "rb") as f:
+            import pickle
+            true_de_map = pickle.load(f)
+        print(f"[eval] 载入真实 DE 缓存: {cache_path}")
+    else:
+        print(f"[eval] 计算真实 DE（{len(pert_list)} 个扰动） ...")
+        tasks = []
+        for p in pert_list:
+            sl_true = true_adata[(true_adata.obs[pert_col] == p) | (true_adata.obs[pert_col] == control_name)]
+            tasks.append((p, sl_true))
+        def _worker(name, adata_slice):
+            return name, _de_genes(adata_slice, name, pert_col, control_name)
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(_worker)(name, slice_) for name, slice_ in tqdm(tasks, desc="True DE")
+        )
+        true_de_map = {k: v for k, v in results}
+        if cache_path:
+            try:
+                import pickle
+                with open(cache_path, "wb") as f:
+                    pickle.dump(true_de_map, f)
+                print(f"[eval] 已缓存真实 DE 至: {cache_path}")
+            except Exception as e:
+                print(f"[eval][警告] 缓存真实 DE 失败：{e}")
+
+    # --- 2) 预测 DE 并对比 ---
+    print(f"[eval] 计算预测 DES ...")
+    def _one(p):
+        true_de_df = true_de_map.get(p, pd.DataFrame(columns=["names", "pvals_adj", "logfoldchanges"]))
+        true_set = set(true_de_df.loc[true_de_df["pvals_adj"] < 0.05, "names"])
+        n_k_true = len(true_set)
+        if n_k_true == 0:
+            return 1.0
+        sl_pred = pred_adata[(pred_adata.obs[pert_col] == p) | (pred_adata.obs[pert_col] == control_name)]
+        pred_de_df = _de_genes(sl_pred, p, pert_col, control_name)
+        # 截断到与真实 DE 数量一致（按 |logFC| 排序）
+        pred_de_df = pred_de_df.sort_values(by="logfoldchanges", key=lambda s: s.abs(), ascending=False)
+        pred_set = set(pred_de_df.head(n_k_true)["names"])
+        inter = len(pred_set & true_set)
+        return inter / (n_k_true if n_k_true > 0 else 1.0)
+
+    scores = Parallel(n_jobs=n_jobs)(delayed(_one)(p) for p in tqdm(pert_list, desc="DES"))
+    return float(np.mean(scores)) if scores else 0.0
+
+
+# -----------------------------
+# 统一评估入口
+# -----------------------------
+def evaluate(
+    pred_adata_or_path: Union[str, ad.AnnData],
+    true_adata_or_path: str,
+    pert_col: str,
+    control_name: str,
+    metrics: List[str],
+    control_adata_path: str = None,
+    run_dir: Optional[str] = None,
+    n_jobs: Union[int, str] = "auto",
+    normalize: bool = True,
+    save_json: bool = True
+) -> Dict[str, float]:
+    """
+    统一评估入口。
+
+    Parameters
+    ----------
+    pred_adata_or_path : Union[str, anndata.AnnData]
+        预测结果（AnnData 或 .h5ad 路径）。
+    true_adata_or_path : str
+        真实数据 .h5ad 路径。
+    pert_col : str
+        扰动列名（如 "target_gene"）。
+    control_name : str
+        控制组名称（如 "non-targeting"）。
+    metrics : List[str]
+        需要计算的指标子集（["MAE","PDS","DES"] 的任意子集）。
+    run_dir : Optional[str]
+        运行目录（用于 DES 的真值缓存与结果保存）。
+    n_jobs : Union[int, str]
+        DES 的并行核数（"auto" => 80% CPU）。
+    normalize : bool
+        是否对 pred/true 执行 normalize_total + log1p。
+    save_json : bool
+        是否把指标落盘为 JSON（metrics/metrics.json）。
+
+    Returns
+    -------
+    Dict[str, float]
+        指标字典。
+    """
+    # 载入
+    pred_adata = ad.read_h5ad(pred_adata_or_path) if isinstance(pred_adata_or_path, str) else pred_adata_or_path
+    true_adata = ad.read_h5ad(true_adata_or_path)
+
+    # 对齐基因顺序
+    common_genes = pred_adata.var_names.intersection(true_adata.var_names)
+    pred_adata = pred_adata[:, common_genes].copy()
+    true_adata = true_adata[:, common_genes].copy()
+
+    # 归一化
+    if normalize:
+        pred_adata = _normalize_if_needed(pred_adata, "预测", verbose=True)
+        true_adata = _normalize_if_needed(true_adata, "真实", verbose=True)
+
+    # 预备
+    pert_list = sorted([p for p in set(true_adata.obs[pert_col]) if p != control_name])
+    pred_profiles = _mean_profiles(pred_adata, pert_col, control_name, list(common_genes))
+    true_profiles = _mean_profiles(true_adata, pert_col, control_name, list(common_genes))
+
+    # auto n_jobs
+    if isinstance(n_jobs, str) and n_jobs.lower() == "auto":
+        try:
+            import multiprocessing as mp
+            n_jobs = max(1, int(mp.cpu_count() * 0.8))
+        except Exception:
+            n_jobs = 1
+
+    out: Dict[str, float] = {}
+
+    # MAE
+    if "MAE" in metrics:
+        out["MAE"] = mae_score(pred_profiles, true_profiles, pert_list)
+        print(f"[eval] MAE: {out['MAE']:.6f}")
+
+    # PDS
+    if "PDS" in metrics:
+        out["PDS"] = pds_score(pred_profiles, true_profiles, pert_list)
+        print(f"[eval] PDS: {out['PDS']:.6f}")
+
+    # DES
+    if "DES" in metrics:
+        out["DES"] = des_score(
+            pred_adata=pred_adata,
+            true_adata=true_adata,
+            pert_col=pert_col,
+            control_name=control_name,
+            n_jobs=int(n_jobs),
+            cache_dir=run_dir,
+        )
+        print(f"[eval] DES: {out['DES']:.6f}")
+
+    # 保存
+    if save_json and run_dir is not None:
+        metrics_dir = os.path.join(run_dir, "metrics")
+        os.makedirs(metrics_dir, exist_ok=True)
+        json_dump(os.path.join(metrics_dir, "metrics.json"), out)
+        print(f"[eval] 已保存指标到 {os.path.join(metrics_dir, 'metrics.json')}")
+
+    return out
+
+```
+
+--- FILE: src/nbglm/_init_.py ---
+```
+# src/nbglm/__init__.py
+# -*- coding: utf-8 -*-
+"""
+nbglm package
+=============
+
+导出常用子模块的简易别名，便于交互式使用：
+>>> from nbglm import data_io, dataset, model, eval, pipelines
+"""
+
+from . import data_io
+from . import dataset
+from . import model
+from . import eval
+from . import pipelines
+from . import utils
+from . import types
+
+```
+
+--- FILE: src/nbglm/data_io.py ---
+```
+# src/nbglm/data_io.py
+# -*- coding: utf-8 -*-
+"""
+数据 I/O（Data I/O）与路径管理工具
+=================================
+
+本模块负责工程中的**数据读写与路径组织**，包括：
+1) 读取/保存 AnnData（.h5ad）
+2) 读取基因与扰动的嵌入矩阵（gene/pert embeddings, CSV）
+3) 针对实验运行构建统一的输出目录结构（run_dir/ckpt/preds/metrics/logs）
+4) 配置快照保存（config snapshot），便于复现（reproducibility）
+
+设计要点（Design Notes）
+-----------------------
+- **解耦**：所有磁盘路径与 I/O 放在此模块，便于统一替换（例如改用 parquet/hdf5）。
+- **容错**：当某些基因/扰动在嵌入表中缺失时，使用零向量（zero vector）占位并警告。
+- **对齐**：嵌入按目标顺序输出，并提供 L2 归一化（row-wise L2 normalization）开关。
+
+依赖（Dependencies）
+-------------------
+- anndata, scanpy（用于 .h5ad 读写）
+- pandas（读 CSV）
+- torch（输出为 torch.Tensor）
+"""
+
+from __future__ import annotations
+
+import os
+import json
+import time
+import math
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import torch
+import anndata as ad
+
+try:
+    import yaml  # 非必需；若缺失则使用 JSON 存配置快照
+    _HAS_YAML = True
+except Exception:
+    _HAS_YAML = False
+
+
+# -----------------------------
+# AnnData 读写
+# -----------------------------
+def read_h5ad(path: str) -> ad.AnnData:
+    """
+    读取 .h5ad 文件（AnnData 格式）。
+
+    Parameters
+    ----------
+    path : str
+        .h5ad 文件路径。
+
+    Returns
+    -------
+    anndata.AnnData
+        读取得到的 AnnData 对象。
+    """
+    path = str(path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"[read_h5ad] 文件不存在: {path}")
+    return ad.read_h5ad(path)
+
+
+def write_h5ad(adata: ad.AnnData, path: str) -> None:
+    """
+    保存 AnnData 到 .h5ad 文件。
+
+    Parameters
+    ----------
+    adata : anndata.AnnData
+        要写入的 AnnData 对象。
+    path : str
+        输出文件路径（若上级目录不存在将自动创建）。
+    """
+    path = str(path)
+    Path(os.path.dirname(path) or ".").mkdir(parents=True, exist_ok=True)
+    adata.write(path)
+
+
+# -----------------------------
+# 嵌入加载与对齐
+# -----------------------------
+def _row_l2_normalize(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """
+    行向量 L2 归一化（Row-wise L2 normalization）。
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        形状 [N, D] 的张量。
+    eps : float
+        数值稳定用的下限。
+
+    Returns
+    -------
+    torch.Tensor
+        L2 归一化后的张量（逐行）。
+    """
+    norms = torch.linalg.norm(x, dim=1, keepdim=True).clamp_min(eps)
+    return x / norms
+
+
+def load_embeddings(
+    gene_embedding_csv: str,
+    pert_embedding_csv: str,
+    gene_names: List[str],
+    pert_names: List[str],
+    l2_normalize: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    加载并对齐基因与扰动的嵌入矩阵（embeddings）。
+
+    输入 CSV 应该满足：
+      - 行索引为实体名称（index 为 gene 名或 perturbation 名）
+      - 列为数值型嵌入维度
+    若目标列表（gene_names / pert_names）中某些名称在 CSV 中缺失，则用**零向量**填充。
+
+    Parameters
+    ----------
+    gene_embedding_csv : str
+        基因嵌入 CSV 文件路径，index=gene 名。
+    pert_embedding_csv : str
+        扰动嵌入 CSV 文件路径，index=pert 名。
+    gene_names : List[str]
+        目标基因顺序（将按此顺序对齐并输出）。
+    pert_names : List[str]
+        目标扰动顺序（将按此顺序对齐并输出）。
+    l2_normalize : bool
+        是否对输出矩阵逐行做 L2 归一化（row-wise）。
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        (G_matrix, P_matrix)
+        - G_matrix: [G, d_g]
+        - P_matrix: [P, d_p]
+    """
+    if not os.path.exists(gene_embedding_csv):
+        raise FileNotFoundError(f"[load_embeddings] 基因嵌入文件不存在: {gene_embedding_csv}")
+    if not os.path.exists(pert_embedding_csv):
+        raise FileNotFoundError(f"[load_embeddings] 扰动嵌入文件不存在: {pert_embedding_csv}")
+
+    gene_df = pd.read_csv(gene_embedding_csv, index_col=0)
+    pert_df = pd.read_csv(pert_embedding_csv, index_col=0)
+
+    # 基因
+    d_g = gene_df.shape[1]
+    G = torch.zeros(len(gene_names), d_g, dtype=torch.float32)
+    missing_genes = []
+    for i, name in enumerate(gene_names):
+        if name in gene_df.index:
+            G[i] = torch.tensor(gene_df.loc[name].values, dtype=torch.float32)
+        else:
+            missing_genes.append(name)
+
+    # 扰动
+    d_p = pert_df.shape[1]
+    P = torch.zeros(len(pert_names), d_p, dtype=torch.float32)
+    missing_perts = []
+    for i, name in enumerate(pert_names):
+        if name in pert_df.index:
+            P[i] = torch.tensor(pert_df.loc[name].values, dtype=torch.float32)
+        else:
+            missing_perts.append(name)
+
+    if missing_genes:
+        print(f"[load_embeddings][警告] {len(missing_genes)} 个基因缺失嵌入，已用零向量填充。示例: {missing_genes[:5]}")
+    if missing_perts:
+        print(f"[load_embeddings][警告] {len(missing_perts)} 个扰动缺失嵌入，已用零向量填充。示例: {missing_perts[:5]}")
+
+    if l2_normalize:
+        G = _row_l2_normalize(G)
+        P = _row_l2_normalize(P)
+
+    return G, P
+
+
+# -----------------------------
+# 运行目录与配置快照
+# -----------------------------
+def make_run_dirs(outputs_root: str, experiment_name: str, timestamp: Optional[str] = None) -> Dict[str, str]:
+    """
+    创建一次运行的输出目录树，并返回常用子目录路径。
+
+    约定的目录结构为：
+    outputs/{experiment_name}__{YYYYmmdd_HHMMSS}/
+      ├─ ckpt/
+      ├─ preds/
+      ├─ metrics/
+      └─ logs/
+
+    Parameters
+    ----------
+    outputs_root : str
+        总输出根目录（如 "./outputs"）。
+    experiment_name : str
+        实验名，用于组装 run_id。
+    timestamp : Optional[str]
+        指定时间戳；若为 None，将使用当前时间。
+
+    Returns
+    -------
+    Dict[str, str]
+        包含 'run_dir', 'ckpt_dir', 'pred_dir', 'metrics_dir', 'logs_dir' 五个键值。
+    """
+    outputs_root = str(outputs_root)
+    Path(outputs_root).mkdir(parents=True, exist_ok=True)
+    if timestamp is None:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+    run_id = f"{experiment_name}__{timestamp}"
+
+    run_dir = os.path.join(outputs_root, run_id)
+    ckpt_dir = os.path.join(run_dir, "ckpt")
+    pred_dir = os.path.join(run_dir, "preds")
+    metrics_dir = os.path.join(run_dir, "metrics")
+    logs_dir = os.path.join(run_dir, "logs")
+
+    for d in (run_dir, ckpt_dir, pred_dir, metrics_dir, logs_dir):
+        Path(d).mkdir(parents=True, exist_ok=True)
+
+    return {
+        "run_dir": run_dir,
+        "ckpt_dir": ckpt_dir,
+        "pred_dir": pred_dir,
+        "metrics_dir": metrics_dir,
+        "logs_dir": logs_dir,
+    }
+
+
+def save_config_snapshot(cfg: dict, out_dir: str, filename_yaml: str = "config.yaml") -> None:
+    """
+    保存配置快照，优先 YAML；若 PyYAML 不可用则保存 JSON。
+
+    Parameters
+    ----------
+    cfg : dict
+        配置字典（或可转为字典的对象）。
+    out_dir : str
+        输出目录（通常为 run_dir）。
+    filename_yaml : str
+        文件名（默认 "config.yaml"）。若不支持 YAML 将用 "config.json"。
+    """
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+
+    # 尝试将非基本类型（如 OmegaConf）转为普通 dict
+    try:
+        from omegaconf import OmegaConf  # 可选
+        if not isinstance(cfg, dict):
+            cfg = OmegaConf.to_container(cfg, resolve=True)
+    except Exception:
+        pass
+
+    if _HAS_YAML:
+        out_path = os.path.join(out_dir, filename_yaml)
+        with open(out_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
+    else:
+        out_path = os.path.join(out_dir, "config.json")
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+    print(f"[save_config_snapshot] 已保存配置快照 -> {out_path}")
+
+
+# -----------------------------
+# 名称与索引工具
+# -----------------------------
+def make_index_with_control_first(
+    names: Iterable[str],
+    control_name: Optional[str] = None
+) -> Tuple[List[str], Dict[str, int]]:
+    """
+    根据名称列表创建索引（index map），并可选择将 control 名称置于首位。
+
+    Parameters
+    ----------
+    names : Iterable[str]
+        名称（基因或扰动）。
+    control_name : Optional[str]
+        若提供，则将该名称（如 "non-targeting"）置于首位。
+
+    Returns
+    -------
+    Tuple[List[str], Dict[str, int]]
+        (ordered_names, name_to_id)
+    """
+    names = sorted(set(names))
+    if control_name and control_name in names:
+        names.remove(control_name)
+        names.insert(0, control_name)
+    name_to_id = {n: i for i, n in enumerate(names)}
+    return names, name_to_id
+
+```
+
