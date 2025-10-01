@@ -38,8 +38,8 @@ model:
   losses:
     primary: "MSE"               # ["MSE","NB","POIS_DEV","NB_DEV","MSE_LOG1P","MSE_ANS"]
   regularization:
-    l1: 1e-4
-    l2: 5e-3
+    l1: 0
+    l2: 0
 
 train:
   fit_mode: "concise"            # ["concise","whole"]；concise=伪批训练（更省显存）
@@ -62,6 +62,7 @@ evaluate:
   enable: true
   metrics: ["MAE", "PDS", "DES"] # 需要的指标子集
   n_jobs: "auto"                 # DES 并行核数（"auto"=80% CPU）
+  true_de_cache: "./data/true_de_cache_all.pkl"  # 预计算的真实 DE 缓存路径（文件或目录）
 
 pipeline:
   mode: "train_sample_eval"      # ["train_sample_eval","train_sample","sample_eval","sample","evaluate_only"]

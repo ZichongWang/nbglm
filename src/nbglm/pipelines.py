@@ -416,6 +416,7 @@ def run_evaluate(cfg: dict, run_dirs: Dict[str, str], pred_adata_or_path: Union[
     pert_col = cfg["data"]["pert_name_col"]
     control_name = cfg["data"]["control_name"]
     n_jobs = ev_cfg.get("n_jobs", "auto")
+    cache_path = ev_cfg.get("true_de_cache", None)
 
     res = ev.evaluate(
         pred_adata_or_path=pred_adata_or_path,
@@ -424,6 +425,7 @@ def run_evaluate(cfg: dict, run_dirs: Dict[str, str], pred_adata_or_path: Union[
         control_name=control_name,
         metrics=metrics,
         run_dir=run_dirs["run_dir"],
+        cache_path=cache_path,
         n_jobs=n_jobs,
         normalize=True,
         save_json=True,

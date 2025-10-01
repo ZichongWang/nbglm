@@ -44,8 +44,10 @@
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Union
+import logging
 import os
 import json
+import pickle
 import warnings
 import numpy as np
 import pandas as pd
@@ -58,32 +60,19 @@ from tqdm import tqdm
 from .utils import json_dump
 
 
+logger = logging.getLogger("nbglm.eval")
+
+
 # -----------------------------
 # 标准化辅助
 # -----------------------------
-def _normalize_if_needed(adata: ad.AnnData, label: str, verbose: bool = True) -> ad.AnnData:
-    """
-    如需则进行 total-count normalize + log1p。
-    这里采取“总是做一次”的保守策略，以避免输入是原始计数时的量纲不匹配。
-
-    Parameters
-    ----------
-    adata : anndata.AnnData
-    label : str
-        日志标签（"预测"/"真实"）。
-    verbose : bool
-
-    Returns
-    -------
-    anndata.AnnData
-        归一化后的数据（原地修改的 copy）。
-    """
+def _normalize_if_needed(adata: ad.AnnData, label: str) -> ad.AnnData:
+    """按照旧脚本逻辑始终执行 total-count 归一化与 log1p。"""
     adata = adata.copy()
-    if verbose:
-        print(f"[eval] 对 '{label}' 数据执行 normalize_total + log1p ...")
+    logger.info(f"检测到 '{label}' 数据为原始计数。正在执行标准化和 log1p 转换...")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        sc.pp.normalize_total(adata, target_sum=5e4)
+        sc.pp.normalize_total(adata, target_sum=1e4)
         sc.pp.log1p(adata)
     return adata
 
@@ -91,29 +80,25 @@ def _normalize_if_needed(adata: ad.AnnData, label: str, verbose: bool = True) ->
 # -----------------------------
 # 均值表达（mean profiles）
 # -----------------------------
-def _mean_profiles(adata: ad.AnnData, pert_col: str, control_name: str, genes: Optional[List[str]] = None) -> pd.DataFrame:
-    """
-    计算每个扰动（以及 control）的**基因均值表达**，[num_perts, G] 的 DataFrame。
-
-    Returns
-    -------
-    pd.DataFrame
-        index: perturbation name；columns: gene symbols（与输入 genes 对齐）
-    """
+def _mean_profiles(
+    adata: ad.AnnData,
+    pert_col: str,
+    control_name: str,
+    pert_list: List[str],
+    genes: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """与旧版评估脚本保持一致的扰动均值表达计算。"""
     if genes is None:
         genes = list(adata.var_names)
-    profiles = {}
+    profiles: Dict[str, np.ndarray] = {}
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        # control
         ctrl = adata[adata.obs[pert_col] == control_name]
-        profiles[control_name] = np.asarray(ctrl.X.mean(axis=0)).reshape(-1)
-        # perts
-        for p in sorted(set(adata.obs[pert_col]) - {control_name}):
-            sub = adata[adata.obs[pert_col] == p]
-            profiles[p] = np.asarray(sub.X.mean(axis=0)).reshape(-1)
-    df = pd.DataFrame(profiles, index=genes).T
-    return df
+        profiles[control_name] = np.asarray(ctrl.X.mean(axis=0)).flatten()
+        for gene in pert_list:
+            sub = adata[adata.obs[pert_col] == gene]
+            profiles[gene] = np.asarray(sub.X.mean(axis=0)).flatten()
+    return pd.DataFrame(profiles, index=genes).T
 
 
 # -----------------------------
@@ -126,36 +111,31 @@ def _mean_profiles(adata: ad.AnnData, pert_col: str, control_name: str, genes: O
 #             vals.append(np.mean(np.abs(pred_profiles.loc[p].values - true_profiles.loc[p].values)))
 #     return float(np.mean(vals)) if vals else 0.0
 def mae_score(pred_profiles: pd.DataFrame, true_profiles: pd.DataFrame, pert_list: List[str]) -> float:
-    vals = []
-    for p in pert_list:
-        if p in pred_profiles.index and p in true_profiles.index:
-            # 关键：按列名对齐
-            a = pred_profiles.loc[p]
-            b = true_profiles.loc[p].reindex(a.index)  # 以 a 的列顺序对齐
-            vals.append(float(np.abs(a - b).mean()))
-    return float(np.mean(vals)) if vals else 0.0
+    """完全按照旧脚本的 MAE 实现。"""
+    mae_scores = [
+        np.mean(np.abs(pred_profiles.loc[g] - true_profiles.loc[g]))
+        for g in pert_list
+        if g in pred_profiles.index and g in true_profiles.index
+    ]
+    return float(np.mean(mae_scores)) if mae_scores else 0.0
 
 
 def pds_score(pred_profiles: pd.DataFrame, true_profiles: pd.DataFrame, pert_list: List[str]) -> float:
-    """
-    使用 L1 距离矩阵并计算“真值扰动的检索名次”得分。
-    """
     if not pert_list:
         return 0.0
     pred_pert = pred_profiles.loc[pert_list]
     true_pert = true_profiles.loc[pert_list]
-    dist = cdist(pred_pert.values, true_pert.values, metric="cityblock")
+    dist_matrix = cdist(pred_pert.values, true_pert.values, metric="cityblock")
     for i, p_gene in enumerate(pert_list):
-        if p_gene in pred_pert.columns and p_gene in true_pert.columns:
-            correction_vector = np.abs(pred_pert[p_gene].loc[p_gene] - true_pert[p_gene].values)
-            # shape: (n_perts, ); 减到 dist 的第 i 行
-            dist[i, :] -= correction_vector
-    dist_df = pd.DataFrame(dist, index=pert_list, columns=pert_list)
-    scores = []
-    for p in pert_list:
-        rank = np.where(dist_df.loc[p].sort_values().index == p)[0][0] + 1  # 1-based
-        N = len(pert_list)
-        scores.append(1.0 - (rank - 1) / N)
+        correction_vector = np.abs(pred_pert.at[p_gene, p_gene] - true_pert[p_gene].values)
+        dist_matrix[i, :] -= correction_vector
+    dist_df = pd.DataFrame(dist_matrix, index=pert_list, columns=pert_list)
+    ranks = [
+        np.where(dist_df.loc[p].sort_values().index == p)[0][0] + 1
+        for p in pert_list
+    ]
+    N = len(pert_list)
+    scores = [1.0 - (rank - 1) / N for rank in ranks]
     return float(np.mean(scores)) if scores else 0.0
 
 
@@ -190,11 +170,53 @@ def _de_genes(adata_slice: ad.AnnData, pert_gene: str, pert_col: str, control_na
             "logfoldchanges": res["logfoldchanges"][pert_gene],
         })
     de_df = de_df.replace([np.inf, -np.inf], np.nan).dropna()
-    return de_df
+    return de_df[de_df["pvals_adj"] < 0.05]
 
 
-def _true_de_cache_path(run_dir: str) -> str:
-    return os.path.join(run_dir, "metrics", "true_de_cache.pkl")
+def _legacy_cache_path(cache_dir: Optional[str]) -> str:
+    if cache_dir:
+        if os.path.isdir(cache_dir):
+            return os.path.join(cache_dir, "true_de_cache.pkl")
+        return cache_dir
+    env_path = os.environ.get("NBGLM_TRUE_DE_CACHE")
+    if env_path:
+        return env_path
+    return "/home/wzc26/work/vcc/NB/true_de_cache.pkl"
+
+
+def _get_ground_truth_de_genes_cached(
+    true_adata: ad.AnnData,
+    pert_list: List[str],
+    pert_col: str,
+    control_name: str,
+    n_jobs: int,
+    cache_dir: Optional[str],
+) -> Dict[str, pd.DataFrame]:
+    cache_path = _legacy_cache_path(cache_dir)
+    if cache_path and os.path.exists(cache_path):
+        logger.info(f"发现缓存文件，正在加载: {cache_path}")
+        with open(cache_path, "rb") as f:
+            return pickle.load(f)
+
+    logger.info(f"未找到缓存。正在为 {len(pert_list)} 个扰动基因计算真实DE基因 (此过程仅需一次)...")
+    tasks = [
+        (
+            gene,
+            true_adata[(true_adata.obs[pert_col] == gene) | (true_adata.obs[pert_col] == control_name)],
+        )
+        for gene in pert_list
+    ]
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(lambda name, sl: (name, _de_genes(sl, name, pert_col, control_name)))(name, sl)
+        for name, sl in tqdm(tasks, desc="计算真实DE基因")
+    )
+    true_de_map = dict(results)
+    if cache_path:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        logger.info(f"正在保存DE结果到缓存: {cache_path}")
+        with open(cache_path, "wb") as f:
+            pickle.dump(true_de_map, f)
+    return true_de_map
 
 
 def des_score(
@@ -222,51 +244,43 @@ def des_score(
         n_jobs = 1
 
     pert_list = sorted([p for p in set(true_adata.obs[pert_col]) if p != control_name])
-    # --- 1) 真值 DE 缓存 ---
-    cache_path = None if cache_dir is None else _true_de_cache_path(cache_dir)
-    if cache_path and os.path.exists(cache_path):
-        with open(cache_path, "rb") as f:
-            import pickle
-            true_de_map = pickle.load(f)
-        print(f"[eval] 载入真实 DE 缓存: {cache_path}")
-    else:
-        print(f"[eval] 计算真实 DE（{len(pert_list)} 个扰动） ...")
-        tasks = []
-        for p in pert_list:
-            sl_true = true_adata[(true_adata.obs[pert_col] == p) | (true_adata.obs[pert_col] == control_name)]
-            tasks.append((p, sl_true))
-        def _worker(name, adata_slice):
-            return name, _de_genes(adata_slice, name, pert_col, control_name)
-        results = Parallel(n_jobs=n_jobs)(
-            delayed(_worker)(name, slice_) for name, slice_ in tqdm(tasks, desc="True DE")
-        )
-        true_de_map = {k: v for k, v in results}
-        if cache_path:
-            try:
-                import pickle
-                with open(cache_path, "wb") as f:
-                    pickle.dump(true_de_map, f)
-                print(f"[eval] 已缓存真实 DE 至: {cache_path}")
-            except Exception as e:
-                print(f"[eval][警告] 缓存真实 DE 失败：{e}")
+    true_de_map = _get_ground_truth_de_genes_cached(
+        true_adata=true_adata,
+        pert_list=pert_list,
+        pert_col=pert_col,
+        control_name=control_name,
+        n_jobs=n_jobs,
+        cache_dir=cache_dir,
+    )
 
-    # --- 2) 预测 DE 并对比 ---
-    print(f"[eval] 计算预测 DES ...")
-    def _one(p):
-        true_de_df = true_de_map.get(p, pd.DataFrame(columns=["names", "pvals_adj", "logfoldchanges"]))
-        true_set = set(true_de_df.loc[true_de_df["pvals_adj"] < 0.05, "names"])
-        n_k_true = len(true_set)
+    logger.info(f"正在使用 {n_jobs} 个CPU核心并行计算 DES...")
+
+    def _compare_des_for_one_gene(pert_gene: str) -> float:
+        true_de_df = true_de_map.get(pert_gene, pd.DataFrame(columns=["names", "pvals_adj", "logfoldchanges"]))
+        true_de_genes = set(true_de_df["names"])
+        n_k_true = len(true_de_genes)
+
         if n_k_true == 0:
             return 1.0
-        sl_pred = pred_adata[(pred_adata.obs[pert_col] == p) | (pred_adata.obs[pert_col] == control_name)]
-        pred_de_df = _de_genes(sl_pred, p, pert_col, control_name)
-        # 截断到与真实 DE 数量一致（按 |logFC| 排序）
-        pred_de_df = pred_de_df.sort_values(by="logfoldchanges", key=lambda s: s.abs(), ascending=False)
-        pred_set = set(pred_de_df.head(n_k_true)["names"])
-        inter = len(pred_set & true_set)
-        return inter / (n_k_true if n_k_true > 0 else 1.0)
 
-    scores = Parallel(n_jobs=n_jobs)(delayed(_one)(p) for p in tqdm(pert_list, desc="DES"))
+        pred_slice = pred_adata[(pred_adata.obs[pert_col] == pert_gene) | (pred_adata.obs[pert_col] == control_name)]
+        full_pred_de_df = _de_genes(pred_slice, pert_gene, pert_col, control_name)
+
+        if len(full_pred_de_df) > n_k_true:
+            sorted_pred = full_pred_de_df.reindex(
+                full_pred_de_df.logfoldchanges.abs().sort_values(ascending=False).index
+            )
+            final_pred_genes = set(sorted_pred.head(n_k_true)["names"])
+        else:
+            final_pred_genes = set(full_pred_de_df["names"])
+
+        intersection_size = len(final_pred_genes.intersection(true_de_genes))
+        return intersection_size / n_k_true
+
+    scores = Parallel(n_jobs=n_jobs)(
+            delayed(_compare_des_for_one_gene)(gene) for gene in pert_list
+        )
+
     return float(np.mean(scores)) if scores else 0.0
 
 
@@ -281,6 +295,7 @@ def evaluate(
     metrics: List[str],
     control_adata_path: str = None,
     run_dir: Optional[str] = None,
+    cache_path: Optional[str] = None,
     n_jobs: Union[int, str] = "auto",
     normalize: bool = True,
     save_json: bool = True
@@ -304,6 +319,8 @@ def evaluate(
         运行目录（用于 DES 的真值缓存与结果保存）。
     n_jobs : Union[int, str]
         DES 的并行核数（"auto" => 80% CPU）。
+    cache_path : Optional[str]
+        预计算的真实 DE 缓存文件或目录；若为目录则自动附加文件名。
     normalize : bool
         是否对 pred/true 执行 normalize_total + log1p。
     save_json : bool
@@ -325,13 +342,13 @@ def evaluate(
 
     # 归一化
     if normalize:
-        pred_adata = _normalize_if_needed(pred_adata, "预测", verbose=True)
-        true_adata = _normalize_if_needed(true_adata, "真实", verbose=True)
+        pred_adata = _normalize_if_needed(pred_adata, "预测")
+        true_adata = _normalize_if_needed(true_adata, "真实")
 
     # 预备
     pert_list = sorted([p for p in set(true_adata.obs[pert_col]) if p != control_name])
-    pred_profiles = _mean_profiles(pred_adata, pert_col, control_name, list(common_genes))
-    true_profiles = _mean_profiles(true_adata, pert_col, control_name, list(common_genes))
+    pred_profiles = _mean_profiles(pred_adata, pert_col, control_name, pert_list, list(common_genes))
+    true_profiles = _mean_profiles(true_adata, pert_col, control_name, pert_list, list(common_genes))
 
     # auto n_jobs
     if isinstance(n_jobs, str) and n_jobs.lower() == "auto":
@@ -346,12 +363,12 @@ def evaluate(
     # MAE
     if "MAE" in metrics:
         out["MAE"] = mae_score(pred_profiles, true_profiles, pert_list)
-        print(f"[eval] MAE: {out['MAE']:.6f}")
+        logger.info(f"[eval] MAE: {out['MAE']:.6f}")
 
     # PDS
     if "PDS" in metrics:
         out["PDS"] = pds_score(pred_profiles, true_profiles, pert_list)
-        print(f"[eval] PDS: {out['PDS']:.6f}")
+        logger.info(f"[eval] PDS: {out['PDS']:.6f}")
 
     # DES
     if "DES" in metrics:
@@ -361,30 +378,34 @@ def evaluate(
             pert_col=pert_col,
             control_name=control_name,
             n_jobs=int(n_jobs),
-            cache_dir=run_dir,
+            cache_dir=cache_path if cache_path is not None else run_dir,
         )
-        print(f"[eval] DES: {out['DES']:.6f}")
+        logger.info(f"[eval] DES: {out['DES']:.6f}")
 
     # 综合得分
     if all(k in out for k in ("DES", "PDS", "MAE")):
         des_baseline = 0.106
         pds_baseline = 0.516
         mae_baseline = 0.027
-        overall = (out["DES"] - des_baseline) / (1 - des_baseline) + (out["PDS"] - pds_baseline) / (1 - pds_baseline) + ((mae_baseline - out["MAE"]) / mae_baseline).clip(0, 1)
+
+        
+        overall = (out["DES"] - des_baseline) / (1 - des_baseline) + \
+                  (out["PDS"] - pds_baseline) / (1 - pds_baseline) + \
+                  np.clip((mae_baseline - out["MAE"]) / mae_baseline, 0, 1)
         overall *= 100 / 3
         out["Overall"] = overall
-        print(f"[eval] 综合得分 (基于 DES, PDS and MAE): {out['Overall']:.6f}")
+        logger.info(f"[eval] 综合得分 (基于 DES, PDS and MAE): {out['Overall']:.6f}")
 
         overall_1 = (out["DES"] - des_baseline) / (1 - des_baseline) + (out["PDS"] - pds_baseline) / (1 - pds_baseline)
         overall_1 *= 100 / 3
         out["Overall_wo_MAE"] = overall_1
-        print(f"[eval] 综合得分 (仅基于 DES and PDS): {out['Overall_wo_MAE']:.6f}")
+        logger.info(f"[eval] 综合得分 (仅基于 DES and PDS): {out['Overall_wo_MAE']:.6f}")
 
     # 保存
     if save_json and run_dir is not None:
         metrics_dir = os.path.join(run_dir, "metrics")
         os.makedirs(metrics_dir, exist_ok=True)
         json_dump(os.path.join(metrics_dir, "metrics.json"), out)
-        print(f"[eval] 已保存指标到 {os.path.join(metrics_dir, 'metrics.json')}")
+        logger.info(f"[eval] 已保存指标到 {os.path.join(metrics_dir, 'metrics.json')}")
 
     return out
