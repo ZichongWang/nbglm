@@ -53,6 +53,7 @@ $$
 from __future__ import annotations
 
 from typing import Callable, Dict, Optional
+import logging
 import math
 import torch
 import torch.nn as nn
@@ -167,7 +168,6 @@ class LowRankNB_GLM(nn.Module):
     ):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"[LowRankNB_GLM] 使用设备: {self.device}")
 
         # 缓存常量到 device
         self.G = gene_emb.to(self.device)                # [n_g, d_g]
@@ -278,6 +278,7 @@ class LowRankNB_GLM(nn.Module):
         """
         loss_type = loss_type.upper()
         optimizer = optim.AdamW(self.parameters(), lr=learning_rate)
+        logger.info(f"[LowRankNB_GLM.fit] Start training with loss: {loss_type}. Device: {self.device}")
 
         def loss_nb_nll(mu: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             """
@@ -391,9 +392,10 @@ class LowRankNB_GLM(nn.Module):
             采样得到的计数矩阵 [N_test, n_g]（在 CPU 上）。
         """
         sampler = sampler.lower()
-        assert sampler in ("poisson", "nb"), "sampler 必须为 'poisson' 或 'nb'"
+        assert sampler in ("poisson", "nb", "gp_mixture"), "sampler 必须为 'poisson' 或 'nb'"
 
         self.eval()
+        logger.info(f"[Sample] Start prediction & sampling with sampler={sampler}, use_sf={use_sf}, use_gamma={use_gamma}, use_cycle={use_cycle}. Device: {self.device}")
         outs = []
         n = pert_ids_test.numel()
         for i in range(0, n, batch_size):
@@ -440,3 +442,4 @@ class LowRankNB_GLM(nn.Module):
             outs.append(sampled.cpu())
 
         return torch.cat(outs, dim=0)
+logger = logging.getLogger("nbglm.model")

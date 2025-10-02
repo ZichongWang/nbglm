@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import json
 import time
@@ -42,6 +43,9 @@ try:
     _HAS_YAML = True
 except Exception:
     _HAS_YAML = False
+
+
+logger = logging.getLogger("nbglm.data_io")
 
 
 # -----------------------------
@@ -170,9 +174,17 @@ def load_embeddings(
             missing_perts.append(name)
 
     if missing_genes:
-        print(f"[load_embeddings][警告] {len(missing_genes)} 个基因缺失嵌入，已用零向量填充。示例: {missing_genes[:5]}")
+        logger.warning(
+            "load_embeddings: %d 个基因缺失嵌入，已用零向量填充。示例: %s",
+            len(missing_genes),
+            missing_genes[:5],
+        )
     if missing_perts:
-        print(f"[load_embeddings][警告] {len(missing_perts)} 个扰动缺失嵌入，已用零向量填充。示例: {missing_perts[:5]}")
+        logger.warning(
+            "load_embeddings: %d 个扰动缺失嵌入，已用零向量填充。示例: %s",
+            len(missing_perts),
+            missing_perts[:5],
+        )
 
     if l2_normalize:
         G = _row_l2_normalize(G)
@@ -265,7 +277,7 @@ def save_config_snapshot(cfg: dict, out_dir: str, filename_yaml: str = "config.y
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
 
-    print(f"[save_config_snapshot] 已保存配置快照 -> {out_path}")
+    logger.info("已保存配置快照 -> %s", out_path)
 
 
 # -----------------------------

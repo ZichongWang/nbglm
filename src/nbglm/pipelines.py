@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 from typing import Dict, Optional, Tuple, Union, Any, List
+import logging
 import os
 import json
 import time
@@ -34,7 +35,10 @@ from . import data_io
 from . import dataset as dset
 from . import model as mdl
 from . import eval as ev
-from .utils import set_seed, get_device, get_logger, ensure_dir
+from .utils import set_seed
+
+
+logger = logging.getLogger("nbglm.pipelines")
 
 
 # -----------------------------
@@ -43,6 +47,8 @@ from .utils import set_seed, get_device, get_logger, ensure_dir
 def _choose_train_h5ad(cfg: dict) -> str:
     paths = cfg.get("paths", {})
     data_cfg = cfg.get("data", {})
+    if cfg['pipeline']['mode'] == 'real':
+        return paths.get("train_h5ad_real", paths.get("train_h5ad"))
     if data_cfg.get("use_split", True):
         return paths.get("train_split_h5ad", paths.get("train_h5ad"))
     return paths.get("train_h5ad")
@@ -204,7 +210,15 @@ def run_train(cfg: dict, run_dirs: Dict[str, str]) -> Dict[str, Any]:
 
     # 读取训练数据与验证列表
     adata_all, adata_pert, pert_col = _load_training_artifacts(cfg)
-    df_val = pd.read_csv(cfg["paths"]["val_list_csv"])
+    pipeline_mode = str(cfg.get("pipeline", {}).get("mode", "")).lower()
+    val_key = "val_list_csv_real" if pipeline_mode == "real" else "val_list_csv"
+    val_csv_path = cfg["paths"].get(val_key)
+    if not val_csv_path:
+        raise KeyError(f"[pipelines] 未找到验证列表路径 paths.{val_key}")
+    df_val = pd.read_csv(val_csv_path)
+
+    control_name = cfg["data"]["control_name"]
+    adata_ctrl = adata_all[adata_all.obs[pert_col] == control_name].copy()
 
     # 嵌入与映射
     emb = _prepare_embeddings_and_maps(cfg, adata_all, df_val)
@@ -242,7 +256,7 @@ def run_train(cfg: dict, run_dirs: Dict[str, str]) -> Dict[str, Any]:
             "pert_names": emb["perts_ordered"],
             "cfg": cfg,
         }, ckpt_path)
-        print(f"[pipelines] 已保存模型到: {ckpt_path}")
+        logger.info("Saving model to %s", ckpt_path)
 
     # 返回对象与元信息
     ret = {
@@ -251,8 +265,13 @@ def run_train(cfg: dict, run_dirs: Dict[str, str]) -> Dict[str, Any]:
             **meta,
             **emb,
             "pert_col": pert_col,
-            "control_name": cfg["data"]["control_name"],
+            "control_name": control_name,
             "train_h5ad_path": _choose_train_h5ad(cfg),
+            "val_list_path": val_csv_path,
+            "df_val": df_val,
+            "adata_all": adata_all,
+            "adata_ctrl": adata_ctrl,
+            "adata_pert": adata_pert,
         },
         "ckpt_path": ckpt_path,
     }
@@ -315,12 +334,31 @@ def run_sample(
         }
 
     # 读取验证列表 & 训练数据（用于 sf 与 phase 统计）
-    df_val = pd.read_csv(cfg["paths"]["val_list_csv"])
-    adata_all = data_io.read_h5ad(meta["train_h5ad_path"])
-    pert_col = meta["pert_col"]
-    control_name = meta["control_name"]
-    adata_ctrl = adata_all[adata_all.obs[pert_col] == control_name].copy()
-    adata_pert = adata_all[adata_all.obs[pert_col] != control_name].copy()
+    pipeline_mode = str(cfg.get("pipeline", {}).get("mode", "")).lower()
+    val_key = "val_list_csv_real" if pipeline_mode == "real" else "val_list_csv"
+
+    df_val = meta.get("df_val") if meta else None
+    if df_val is None:
+        val_csv_path = (meta or {}).get("val_list_path") or cfg["paths"].get(val_key)
+        if not val_csv_path:
+            raise KeyError(f"[pipelines] 未找到验证列表路径 paths.{val_key}")
+        df_val = pd.read_csv(val_csv_path)
+
+    pert_col = meta.get("pert_col", cfg["data"]["pert_name_col"]) if meta else cfg["data"]["pert_name_col"]
+    control_name = meta.get("control_name", cfg["data"]["control_name"]) if meta else cfg["data"]["control_name"]
+
+    train_h5ad_path = meta.get("train_h5ad_path", _choose_train_h5ad(cfg)) if meta else _choose_train_h5ad(cfg)
+    adata_all = meta.get("adata_all") if meta else None
+    if adata_all is None:
+        adata_all = data_io.read_h5ad(train_h5ad_path)
+
+    adata_ctrl = meta.get("adata_ctrl") if meta else None
+    if adata_ctrl is None:
+        adata_ctrl = adata_all[adata_all.obs[pert_col] == control_name].copy()
+
+    adata_pert = meta.get("adata_pert") if meta else None
+    if adata_pert is None:
+        adata_pert = adata_all[adata_all.obs[pert_col] != control_name].copy()
 
     # 构造测试 pert id 列表
     if pert_col in df_val.columns:
@@ -341,8 +379,11 @@ def run_sample(
     # size factor：根据 control 分布 + df_val 的 median_umi 构造
     use_sf = bool(cfg.get("size_factor", {}).get("use_sf", True))
     if use_sf:
-        X_ctrl = dset.to_tensor(adata_ctrl.X)
-        sf_ctrl, ref_depth = dset.compute_size_factors(X_ctrl)  # 重新估计（与训练一致）
+        sf_ctrl = meta.get("sf_ctrl") if meta else None
+        ref_depth = meta.get("ref_depth") if meta else None
+        if sf_ctrl is None or ref_depth is None:
+            X_ctrl = dset.to_tensor(adata_ctrl.X)
+            sf_ctrl, ref_depth = dset.compute_size_factors(X_ctrl)  # 重新估计（与训练一致）
         sf_test = dset.build_validation_size_factors(df_val, sf_ctrl, ref_depth, seed=int(cfg["experiment"].get("seed", 2025)))
     else:
         sf_test = None
@@ -393,7 +434,7 @@ def run_sample(
     if bool(cfg["pipeline"].get("persist_intermediate", True)):
         out_path = os.path.join(run_dirs["pred_dir"], "pred.h5ad")
         ad_final.write(out_path)
-        print(f"[pipelines] 已保存预测到: {out_path}")
+        logger.info("Saving prediction to %s", out_path)
         return {"pred_adata_path": out_path}
     else:
         return {"pred_adata": ad_final}
@@ -408,7 +449,7 @@ def run_evaluate(cfg: dict, run_dirs: Dict[str, str], pred_adata_or_path: Union[
     """
     ev_cfg = cfg.get("evaluate", {})
     if not bool(ev_cfg.get("enable", True)):
-        print("[pipelines] 评估被禁用（evaluate.enable=false）。")
+        logger.info("评估被禁用（evaluate.enable=false）")
         return {"metrics": {}}
 
     metrics = list(ev_cfg.get("metrics", ["MAE", "PDS", "DES"]))
@@ -467,3 +508,4 @@ def run_evaluate_only(cfg: dict, run_dirs: Dict[str, str]) -> Dict[str, Any]:
     if not pred_path or not os.path.exists(pred_path):
         raise FileNotFoundError("[pipelines] evaluate_only 模式需要提供 paths.pred_h5ad")
     return run_evaluate(cfg, run_dirs, pred_adata_or_path=pred_path)
+

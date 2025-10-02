@@ -120,6 +120,8 @@ def main():
         out = pipelines.run_sample_only(cfg, run_dirs)
     elif mode == "evaluate_only":
         out = pipelines.run_evaluate_only(cfg, run_dirs)
+    elif mode == "real":
+        out = pipelines.run_train_sample(cfg, run_dirs)
     else:
         raise ValueError(f"[run] 未知 pipeline.mode: {mode}")
 

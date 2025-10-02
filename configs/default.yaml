@@ -15,6 +15,9 @@ paths:
   train_split_h5ad: "./data/Official_Data_Split/train.h5ad"  # 当 data.use_split=true 时优先
   test_h5ad: "./data/Official_Data_Split/test.h5ad"          # 评估时真实标签
   val_list_csv: "./data/Official_Data_Split/test_pert_info.csv"  # 采样清单：target_gene, n_cells, median_umi_per_cell
+  train_h5ad_real: "./data/adata_pp.h5ad"  
+  val_list_csv_real: "./data/pert_counts_Validation.csv"  # 用于真实数据采样的清单
+  ctrl_h5ad: "./data/adata_ctrl.h5ad" 
 
   # 嵌入（embeddings）
   gene_embedding_csv: "./data/PCA_gene_embedding_512D.csv"
@@ -51,7 +54,7 @@ size_factor:
   use_sf: true                   # 是否在训练与采样使用 size factor 作为 offset（log_s）
 
 sampling:
-  sampler: "nb"             # ["poisson","nb"]
+  sampler: "nb"             # ["poisson","nb","gp_mixture"]
   batch_size: 4096
   gamma_heterogeneity:
     enable: false                 # 是否在采样时引入 Gamma(r0,r0) 细胞级异质性
@@ -65,6 +68,6 @@ evaluate:
   true_de_cache: "./data/true_de_cache_all.pkl"  # 预计算的真实 DE 缓存路径（文件或目录）
 
 pipeline:
-  mode: "train_sample_eval"      # ["train_sample_eval","train_sample","sample_eval","sample","evaluate_only"]
+  mode: "train_sample_eval"      # ["train_sample_eval","train_sample","sample_eval","sample","evaluate_only", "real"]
   persist_intermediate: true     # true: 保存 ckpt/pred 文件；false: 采样→评估内存直连
   # pretrained_ckpt: "./outputs/xxx/ckpt/model.pt"  # 当 mode=sample 或 sample_eval 时从该权重采样

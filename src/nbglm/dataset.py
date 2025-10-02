@@ -465,7 +465,7 @@ def build_pseudobulk(
         counts = torch.zeros(K, dtype=torch.long)
         lib_sum = torch.zeros(K, dtype=torch.float32)
 
-        for start in tqdm(range(0, N, batch_size), desc="构建 pseudo-bulk (no phase, CPU)"):
+        for start in range(0, N, batch_size):
             end = min(start + batch_size, N)
             Xb = X_pert_train[start:end]
             invb = inverse_indices[start:end]
