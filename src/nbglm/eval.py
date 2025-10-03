@@ -388,15 +388,15 @@ def evaluate(
         pds_baseline = 0.516
         mae_baseline = 0.027
 
-        
-        overall = (out["DES"] - des_baseline) / (1 - des_baseline) + \
-                  (out["PDS"] - pds_baseline) / (1 - pds_baseline) + \
-                  np.clip((mae_baseline - out["MAE"]) / mae_baseline, 0, 1)
-        overall *= 100 / 3
+        des_scaled = np.clip((out["DES"] - des_baseline) / (1 - des_baseline), 0, 1)
+        pds_scaled = np.clip((out["PDS"] - pds_baseline) / (1 - pds_baseline), 0, 1)
+        mae_scaled = np.clip((mae_baseline - out["MAE"]) / mae_baseline, 0, 1)
+        overall = 100.0 * (des_scaled + pds_scaled + mae_scaled) / 3.0
+
         out["Overall"] = overall
         logger.info(f"[eval] 综合得分 (基于 DES, PDS and MAE): {out['Overall']:.6f}")
 
-        overall_1 = (out["DES"] - des_baseline) / (1 - des_baseline) + (out["PDS"] - pds_baseline) / (1 - pds_baseline)
+        overall_1 = des_scaled + pds_scaled
         overall_1 *= 100 / 3
         out["Overall_wo_MAE"] = overall_1
         logger.info(f"[eval] 综合得分 (仅基于 DES and PDS): {out['Overall_wo_MAE']:.6f}")

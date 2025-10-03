@@ -63,6 +63,10 @@ import torch.optim as optim
 # -----------------------------
 # 损失函数集合（Registry）
 # -----------------------------
+
+def _loss_poisson(mu_pred: torch.Tensor, y_true: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    return nn.PoissonNLLLoss(log_input=False, full=False, eps=eps)(mu_pred, y_true)
+
 def _loss_mse(mu_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
     return nn.MSELoss()(mu_pred, y_true)
 
@@ -117,6 +121,7 @@ LOSSES_NO_THETA: Dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]]
     "MSE_LOG1P": _loss_mse_log1p,
     "MSE_ANS": _loss_mse_anscombe,
     "POIS_DEV": _loss_pois_dev,  # 需要额外 eps，已内置缺省
+    "POIS": _loss_poisson,       # 需要额外 eps，已内置缺省
 }
 
 # 需要 theta 的损失单独处理（例如 NB_DEV、NB_NLL）

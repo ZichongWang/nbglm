@@ -39,7 +39,7 @@ model:
   name: "lowrank_nb_glm"         # 目前仅此模型；为未来扩展做占位
   use_cycle: false                # 是否在 log-mean 中加入 S/G2M 固定效应（G1 基线）
   losses:
-    primary: "MSE"               # ["MSE","NB","POIS_DEV","NB_DEV","MSE_LOG1P","MSE_ANS"]
+    primary: "MSE"               # ["MSE","NB","POIS_DEV","NB_DEV","MSE_LOG1P","MSE_ANS","POIS"]
   regularization:
     l1: 0
     l2: 0
