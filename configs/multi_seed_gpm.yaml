@@ -5,7 +5,7 @@
 # 如需修改，请尽量维持结构不变，仅改数值。
 
 experiment:
-  name: "baseline_nbglm"   # 本次实验名（用于输出目录命名）
+  name: "multi_seed_gpm"   # 本次实验名（用于输出目录命名）
   seed: 2025               # 全局随机种子
   device: "auto"           # "auto" | "cpu" | "cuda" | "cuda:0" ...
 
@@ -54,7 +54,7 @@ size_factor:
   use_sf: true                   # 是否在训练与采样使用 size factor 作为 offset（log_s）
 
 sampling:
-  sampler: "nb"             # ["poisson","nb","gp_mixture"]
+  sampler: "gp_mixture"             # ["poisson","nb","gp_mixture"]
   batch_size: 4096
   gamma_heterogeneity:
     enable: false                 # 是否在采样时引入 Gamma(r0,r0) 细胞级异质性
@@ -64,12 +64,19 @@ sampling:
 evaluate:
   enable: true
   metrics: ["MAE", "PDS", "DES"] # 需要的指标子集
-  n_jobs: "auto"                 # DES 并行核数（"auto"=25% CPU）
+  n_jobs: "auto"                 # DES 并行核数（"auto"=80% CPU）
   true_de_cache: "./data/true_de_cache_all.pkl"  # 预计算的真实 DE 缓存路径（文件或目录）
 
 pipeline:
-  mode: "train_sample_eval"      # ["train_sample_eval","train_sample","sample_eval","sample","evaluate_only", "real"]
-  persist_intermediate: true     # true: 保存 ckpt/pred 文件；false: 采样→评估内存直连
+  mode: multi_seed
+  seeds: [123, 42, 2025, 3704]
+  multi_seed_devices: [0, 1, 2, 3]     # optional GPU mapping per worker
+  multi_seed_max_workers: 4            # optional cap on concurrent workers
+  persist_intermediate: true           # must stay true so each worker writes outputs
+  multi_seed_base_mode: train_sample_eval
+# pipeline:
+#   mode: "train_sample_eval"      # ["train_sample_eval","train_sample","sample_eval","sample","evaluate_only", "real"]
+#   persist_intermediate: true     # true: 保存 ckpt/pred 文件；false: 采样→评估内存直连
   # pretrained_ckpt: "./outputs/xxx/ckpt/model.pt"  # 当 mode=sample 或 sample_eval 时从该权重采样
   # seeds: [2025, 2026, 2027]      # 当 mode=multi_seed 时需提供的随机种子列表
   # multi_seed_base_mode: "train_sample_eval"  # multi_seed 模式下，逐个种子执行的内部模式

@@ -73,6 +73,54 @@ Outputs will be placed under `outputs/{experiment_name}__{timestamp}`/ with:
    + `sample_eval` (requires `pipeline.pretrained_ckpt`)
    + `sample`
    + `evaluate_only` (requires `paths.pred_h5ad`)
+   + `multi_seed` (provide `pipeline.seeds` and optional `pipeline.multi_seed_base_mode`)
+
+  When `pipeline.mode=multi_seed`, list the seeds you want to sweep, e.g.:
+
+  ```yaml
+  pipeline:
+    mode: multi_seed
+    seeds: [301, 302, 303]
+    multi_seed_base_mode: train_sample_eval  # defaults to train_sample_eval if omitted
+    multi_seed_devices: [0, 1, 2]            # optional: map each seed to a GPU (spawned in parallel)
+    multi_seed_max_workers: 3                # optional: cap concurrent processes (default = device count)
+  ```
+
+  Multi-seed runs spawn independent subprocesses, each with its own `outputs/.../seed_{seed}/` bundle (config snapshot, logs, checkpoints, metrics). An aggregated `metrics/multi_seed_metrics.json` is emitted at the parent level summarizing per-seed scores. Keep `pipeline.persist_intermediate=true` so predictions are written to disk instead of shared in-memory objects.
+
+## Multi-Seed Usage
+
+1. **Configure seeds and GPUs**
+   ```yaml
+   experiment:
+     name: baseline_nbglm_multi_seed
+   pipeline:
+     mode: multi_seed
+     seeds: [101, 202, 303, 404]
+     multi_seed_devices: [0, 1, 2, 3]     # optional GPU mapping per worker
+     multi_seed_max_workers: 4            # optional cap on concurrent workers
+     persist_intermediate: true           # must stay true so each worker writes outputs
+     multi_seed_base_mode: train_sample_eval
+   ```
+
+2. **Launch from the CLI**
+   ```bash
+   python run.py --config configs/default.yaml \\
+     --set pipeline.mode=multi_seed \\
+     --set pipeline.seeds=[101,202,303,404] \\
+     --set pipeline.multi_seed_devices=[0,1,2,3]
+   ```
+   - Drop `pipeline.multi_seed_devices` to inherit the current `CUDA_VISIBLE_DEVICES` (or fall back to CPU).
+   - Use `--set pipeline.multi_seed_max_workers=2` to limit concurrency without changing the seed list.
+
+3. **Inspect the outputs**
+   - Parent folder: `outputs/{experiment_name}__{timestamp}/`.
+   - Each seed writes to `seed_{seed}/` with its own `config.yaml`, `logs/run.log`, `ckpt/`, `preds/`, and `metrics/`.
+   - Aggregated statistics live at `metrics/multi_seed_metrics.json`, including per-seed metrics, assigned devices, and mean/std/min/max summaries.
+
+4. **Reproducibility tips**
+   - Set `experiment.seed` in addition to `pipeline.seeds` if downstream logic uses a global seed.
+   - Make sure GPU indices match the device ordering from `nvidia-smi`; strings like `"cuda:2"` are normalized to `2`, while `"cpu"`/`-1` forces a CPU run.
 
 + To switch **whole-cell** vs **pseudo-bulk** training:
    + `train.fit_mode: whole | concise`

@@ -122,6 +122,8 @@ def main():
         out = pipelines.run_evaluate_only(cfg, run_dirs)
     elif mode == "real":
         out = pipelines.run_train_sample(cfg, run_dirs)
+    elif mode == "multi_seed":
+        out = pipelines.run_multi_seed(cfg, run_dirs)
     else:
         raise ValueError(f"[run] 未知 pipeline.mode: {mode}")
 

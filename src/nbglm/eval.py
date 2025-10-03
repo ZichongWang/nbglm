@@ -354,7 +354,7 @@ def evaluate(
     if isinstance(n_jobs, str) and n_jobs.lower() == "auto":
         try:
             import multiprocessing as mp
-            n_jobs = max(1, int(mp.cpu_count() * 0.8))
+            n_jobs = max(1, int(mp.cpu_count() * 0.25))
         except Exception:
             n_jobs = 1
 

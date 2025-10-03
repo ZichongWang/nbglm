@@ -20,10 +20,13 @@
 from __future__ import annotations
 
 from typing import Dict, Optional, Tuple, Union, Any, List
+import copy
 import logging
 import os
-import json
 import time
+from numbers import Number
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
 
 import numpy as np
 import pandas as pd
@@ -35,7 +38,7 @@ from . import data_io
 from . import dataset as dset
 from . import model as mdl
 from . import eval as ev
-from .utils import set_seed
+from .utils import set_seed, json_dump, get_logger
 
 
 logger = logging.getLogger("nbglm.pipelines")
@@ -44,6 +47,131 @@ logger = logging.getLogger("nbglm.pipelines")
 # -----------------------------
 # 内部小工具
 # -----------------------------
+def _make_child_run_dirs(parent_run_dir: str, label: str) -> Dict[str, str]:
+    """Create a nested run directory under ``parent_run_dir`` for grouped executions."""
+    seed_dir = os.path.join(parent_run_dir, label)
+    ckpt_dir = os.path.join(seed_dir, "ckpt")
+    pred_dir = os.path.join(seed_dir, "preds")
+    metrics_dir = os.path.join(seed_dir, "metrics")
+    logs_dir = os.path.join(seed_dir, "logs")
+
+    for d in (seed_dir, ckpt_dir, pred_dir, metrics_dir, logs_dir):
+        os.makedirs(d, exist_ok=True)
+
+    return {
+        "run_dir": seed_dir,
+        "ckpt_dir": ckpt_dir,
+        "pred_dir": pred_dir,
+        "metrics_dir": metrics_dir,
+        "logs_dir": logs_dir,
+    }
+
+
+def _parse_seeds(values: Any) -> List[int]:
+    if isinstance(values, Number):
+        return [int(values)]
+    if isinstance(values, str):
+        parts = [p.strip() for p in values.split(",") if p.strip()]
+        if not parts:
+            raise ValueError("[pipelines] pipeline.seeds 字符串格式错误")
+        return [int(p) for p in parts]
+    if isinstance(values, (list, tuple, set)):
+        return [int(v) for v in values]
+    raise ValueError("[pipelines] pipeline.seeds 需为整数或整数列表")
+
+
+def _parse_devices(values: Any) -> List[Optional[str]]:
+    if values is None:
+        return []
+    if isinstance(values, Number):
+        return [str(int(values))]
+    if isinstance(values, str):
+        parts = [p.strip() for p in values.split(",") if p.strip()]
+        if not parts:
+            raise ValueError("[pipelines] pipeline.multi_seed_devices 字符串格式错误")
+        return [p for p in parts]
+    if isinstance(values, (list, tuple, set)):
+        return [str(v) for v in values]
+    raise ValueError("[pipelines] pipeline.multi_seed_devices 需为字符串、数字或列表")
+
+
+def _normalize_device_id(device: Optional[str]) -> Optional[str]:
+    if device is None:
+        return None
+    text = str(device).strip()
+    if not text:
+        return None
+    lower = text.lower()
+    if lower in {"cpu", "none", "-1"}:
+        return None
+    if lower.startswith("cuda:"):
+        return lower.split(":", 1)[1]
+    return text
+
+
+def _assign_devices(device_list: List[Optional[str]], count: int) -> List[Optional[str]]:
+    if not device_list:
+        return [None] * count
+    normalized = [_normalize_device_id(d) for d in device_list]
+    if all(d is None for d in normalized):
+        return [None] * count
+    return [normalized[i % len(normalized)] for i in range(count)]
+
+
+def _prepare_seed_executor_payload(
+    cfg: dict,
+    seed_int: int,
+    base_mode: str,
+    seed_dirs: Dict[str, str],
+) -> dict:
+    seed_cfg = copy.deepcopy(cfg)
+    seed_cfg.setdefault("experiment", {})["seed"] = seed_int
+    seed_cfg.setdefault("pipeline", {})["mode"] = base_mode
+    # 确保子任务不会意外再触发 multi_seed
+    seed_cfg["pipeline"].pop("seeds", None)
+    seed_cfg["pipeline"].pop("multi_seed_devices", None)
+    seed_cfg["pipeline"].pop("multi_seed_max_workers", None)
+    return seed_cfg
+
+
+def _run_seed_job(
+    seed_int: int,
+    seed_cfg: dict,
+    seed_dirs: Dict[str, str],
+    base_mode: str,
+    visible_device: Optional[str],
+) -> Dict[str, Any]:
+    if visible_device is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = visible_device
+        exp = seed_cfg.setdefault("experiment", {})
+        if str(exp.get("device", "auto")).lower() != "cpu":
+            exp["device"] = "cuda"
+    else:
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+
+    logger = get_logger(seed_dirs["run_dir"])
+    logger.info("[multi_seed-worker] seed=%d, device=%s", seed_int, visible_device or "cpu")
+
+    data_io.save_config_snapshot(seed_cfg, seed_dirs["run_dir"])
+    set_seed(seed_int)
+
+    dispatch = {
+        "train_sample_eval": run_train_sample_eval,
+        "train_sample": run_train_sample,
+        "sample_eval": run_sample_eval,
+        "sample": run_sample_only,
+        "evaluate_only": run_evaluate_only,
+        "real": run_train_sample,
+    }
+    if base_mode not in dispatch:
+        raise ValueError(f"[pipelines] multi_seed_base_mode 不支持: {base_mode}")
+
+    result = dispatch[base_mode](seed_cfg, seed_dirs)
+    if "pred_adata" in result:
+        raise ValueError("[pipelines] multi_seed 仅支持 persist_intermediate=true (需写盘预测结果)")
+    return result
+
+
 def _choose_train_h5ad(cfg: dict) -> str:
     paths = cfg.get("paths", {})
     data_cfg = cfg.get("data", {})
@@ -477,6 +605,123 @@ def run_evaluate(cfg: dict, run_dirs: Dict[str, str], pred_adata_or_path: Union[
 # -----------------------------
 # 组合模式
 # -----------------------------
+def run_multi_seed(cfg: dict, run_dirs: Dict[str, str]) -> Dict[str, Any]:
+    """Execute a pipeline multiple times with different random seeds (optionally in parallel)."""
+    pipeline_cfg = cfg.get("pipeline", {})
+    if not bool(pipeline_cfg.get("persist_intermediate", True)):
+        raise ValueError("[pipelines] multi_seed 模式需要 pipeline.persist_intermediate=true 以写盘传递结果")
+
+    seeds_cfg = pipeline_cfg.get("seeds")
+    if seeds_cfg is None:
+        raise ValueError("[pipelines] multi_seed 模式需要提供 pipeline.seeds")
+    seeds = _parse_seeds(seeds_cfg)
+    if not seeds:
+        raise ValueError("[pipelines] pipeline.seeds 不能为空")
+
+    base_mode = str(pipeline_cfg.get("multi_seed_base_mode", "train_sample_eval")).lower()
+    if base_mode == "multi_seed":
+        raise ValueError("[pipelines] multi_seed_base_mode 不可再指定为 multi_seed")
+
+    device_cfg = pipeline_cfg.get("multi_seed_devices")
+    device_list = _assign_devices(_parse_devices(device_cfg) if device_cfg is not None else [], len(seeds))
+
+    max_workers_cfg = pipeline_cfg.get("multi_seed_max_workers")
+    if max_workers_cfg is None:
+        if any(dev is not None for dev in device_list):
+            max_workers = len({dev for dev in device_list if dev is not None})
+        else:
+            max_workers = len(seeds)
+    else:
+        max_workers = int(max_workers_cfg)
+    max_workers = max(1, min(max_workers, len(seeds)))
+
+    logger.info(
+        "[multi_seed] seeds=%s, base_mode=%s, max_workers=%d, devices=%s",
+        seeds,
+        base_mode,
+        max_workers,
+        device_list,
+    )
+
+    ctx = mp.get_context("spawn")
+    future_map = {}
+    seed_results: Dict[int, Dict[str, Any]] = {}
+    metrics_collection: Dict[int, Dict[str, float]] = {}
+    device_assignments: Dict[int, Optional[str]] = {}
+
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
+        for idx, seed in enumerate(seeds):
+            seed_int = int(seed)
+            visible_device = device_list[idx]
+            device_assignments[seed_int] = visible_device
+
+            seed_dirs = _make_child_run_dirs(run_dirs["run_dir"], f"seed_{seed_int}")
+            seed_cfg = _prepare_seed_executor_payload(cfg, seed_int, base_mode, seed_dirs)
+
+            future = executor.submit(_run_seed_job, seed_int, seed_cfg, seed_dirs, base_mode, visible_device)
+            future_map[future] = (seed_int, seed_dirs)
+
+        for future in as_completed(future_map):
+            seed_int, seed_dirs = future_map[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                logger.exception("[multi_seed] seed=%d 运行失败", seed_int)
+                raise
+
+            metrics = {}
+            if isinstance(result.get("metrics"), dict):
+                metrics = {k: float(v) for k, v in result["metrics"].items() if isinstance(v, Number)}
+            metrics_collection[seed_int] = metrics
+
+            run_entry: Dict[str, Any] = {"seed": seed_int, "run_dir": seed_dirs["run_dir"], "device": device_assignments[seed_int] or "cpu"}
+            for key, value in result.items():
+                if key == "metrics" and isinstance(result.get("metrics"), dict):
+                    run_entry[key] = metrics
+                else:
+                    run_entry[key] = value
+            seed_results[seed_int] = run_entry
+            logger.info("[multi_seed] 完成 seed=%d", seed_int)
+
+    sorted_seeds = [int(s) for s in seeds]
+    per_seed_runs = [seed_results[s] for s in sorted_seeds]
+    metrics_list = [{"seed": s, "metrics": metrics_collection.get(s, {})} for s in sorted_seeds]
+
+    aggregated_metrics: Dict[str, Dict[str, float]] = {}
+    all_keys = sorted({k for metrics in metrics_collection.values() for k in metrics.keys()})
+    for key in all_keys:
+        values = [metrics_collection[s][key] for s in sorted_seeds if key in metrics_collection.get(s, {})]
+        if not values:
+            continue
+        aggregated_metrics[key] = {
+            "mean": float(np.mean(values)),
+            "std": float(np.std(values, ddof=0)),
+            "min": float(np.min(values)),
+            "max": float(np.max(values)),
+        }
+
+    summary_path = None
+    if aggregated_metrics or metrics_list:
+        summary_payload = {
+            "base_mode": base_mode,
+            "seeds": sorted_seeds,
+            "devices": {seed: device_assignments[seed] for seed in sorted_seeds},
+            "per_seed": metrics_list,
+            "aggregate": aggregated_metrics,
+        }
+        summary_path = os.path.join(run_dirs["metrics_dir"], "multi_seed_metrics.json")
+        json_dump(summary_path, summary_payload)
+        logger.info("[multi_seed] 指标汇总写入 %s", summary_path)
+
+    return {
+        "base_mode": base_mode,
+        "seeds": sorted_seeds,
+        "seed_runs": per_seed_runs,
+        "aggregated_metrics": aggregated_metrics,
+        "summary_path": summary_path,
+    }
+
+
 def run_train_sample_eval(cfg: dict, run_dirs: Dict[str, str]) -> Dict[str, Any]:
     t = run_train(cfg, run_dirs)
     s = run_sample(cfg, run_dirs, model=t["model"], meta=t["meta"])
@@ -508,4 +753,3 @@ def run_evaluate_only(cfg: dict, run_dirs: Dict[str, str]) -> Dict[str, Any]:
     if not pred_path or not os.path.exists(pred_path):
         raise FileNotFoundError("[pipelines] evaluate_only 模式需要提供 paths.pred_h5ad")
     return run_evaluate(cfg, run_dirs, pred_adata_or_path=pred_path)
-
