@@ -56,7 +56,8 @@ import scanpy as sc
 from scipy.spatial.distance import cdist
 from joblib import Parallel, delayed
 from tqdm import tqdm
-
+from statsmodels.stats.multitest import multipletests
+from scipy.stats import rankdata, norm
 from .utils import json_dump
 
 
@@ -267,13 +268,16 @@ def des_score(
         full_pred_de_df = _de_genes(pred_slice, pert_gene, pert_col, control_name)
 
         if len(full_pred_de_df) > n_k_true:
+                    # 在预测 DE 中按 |logFC| 排序，取前 n_k_true
             sorted_pred = full_pred_de_df.reindex(
-                full_pred_de_df.logfoldchanges.abs().sort_values(ascending=False).index
+                full_pred_de_df["logfoldchanges"].abs().sort_values(ascending=False).index
             )
             final_pred_genes = set(sorted_pred.head(n_k_true)["names"])
         else:
             final_pred_genes = set(full_pred_de_df["names"])
 
+        assert final_pred_genes.issubset(set(full_pred_de_df["names"])), \
+                    "Truncation must remain within predicted DE set"
         intersection_size = len(final_pred_genes.intersection(true_de_genes))
         return intersection_size / n_k_true
 

@@ -134,3 +134,4 @@ Outputs will be placed under `outputs/{experiment_name}__{timestamp}`/ with:
 + The project uses **row-wise L2 normalized embeddings** by default.
 
 + Checkpoints include `G/P` matrices, `mu_control`, and `theta` to ensure portability.
+
