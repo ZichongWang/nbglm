@@ -15,7 +15,6 @@ python run.py \
    --set pipeline.mode=evaluate_only \
    --set paths.pred_h5ad=/absolute/path/to/your_predictions.h5ad \
    --set experiment.name=eval_existing_pred \
-   --set sampling.sampler=gp_mixture
 ```
 ## Directory
 
