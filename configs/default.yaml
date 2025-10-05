@@ -63,9 +63,10 @@ sampling:
 
 evaluate:
   enable: true
+  backend: "vcc"             # "legacy" uses src/nbglm/eval.py, "vcc" uses src/nbglm/vcc_eval.py
   metrics: ["MAE", "PDS", "DES"] # 需要的指标子集
-  n_jobs: "auto"                 # DES 并行核数（"auto"=25% CPU）
-  true_de_cache: "./data/true_de_cache_all.pkl"  # 预计算的真实 DE 缓存路径（文件或目录）
+  n_jobs: "auto"                 # DES 并行核数（"auto" uses up to 90% of available cores）
+  true_de_cache: "./data/test_de_cache"  # 预计算的真实 DE 缓存路径（文件或目录）
 
 pipeline:
   mode: "train_sample_eval"      # ["train_sample_eval","train_sample","sample_eval","sample","evaluate_only", "real"]

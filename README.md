@@ -87,6 +87,8 @@ Outputs will be placed under `outputs/{experiment_name}__{timestamp}`/ with:
 
   Multi-seed runs spawn independent subprocesses, each with its own `outputs/.../seed_{seed}/` bundle (config snapshot, logs, checkpoints, metrics). An aggregated `metrics/multi_seed_metrics.json` is emitted at the parent level summarizing per-seed scores. Keep `pipeline.persist_intermediate=true` so predictions are written to disk instead of shared in-memory objects.
 
++ `evaluate.backend`: choose `"legacy"` for the original evaluator (`src/nbglm/eval.py`) or `"vcc"` for the VCC metrics (`src/nbglm/vcc_eval.py`). The default is `"legacy"`.
+
 ## Multi-Seed Usage
 
 1. **Configure seeds and GPUs**
@@ -133,4 +135,3 @@ Outputs will be placed under `outputs/{experiment_name}__{timestamp}`/ with:
 + The project uses **row-wise L2 normalized embeddings** by default.
 
 + Checkpoints include `G/P` matrices, `mu_control`, and `theta` to ensure portability.
-

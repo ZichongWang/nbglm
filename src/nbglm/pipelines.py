@@ -587,7 +587,21 @@ def run_evaluate(cfg: dict, run_dirs: Dict[str, str], pred_adata_or_path: Union[
     n_jobs = ev_cfg.get("n_jobs", "auto")
     cache_path = ev_cfg.get("true_de_cache", None)
 
-    res = ev.evaluate(
+    backend = str(ev_cfg.get("backend", "vcc")).strip().lower()
+    if backend in {"", "legacy"}:
+        evaluator = ev.evaluate
+    elif backend in {"vcc", "vcceval", "vcc_eval"}:
+        try:
+            from . import vcc_eval as vcc_ev  # type: ignore
+        except Exception as exc:  # pragma: no cover - import guard
+            raise ImportError(
+                "Failed to import vcc_eval backend. Ensure optional dependencies are installed."
+            ) from exc
+        evaluator = vcc_ev.evaluate  # type: ignore[attr-defined]
+    else:
+        raise ValueError(f"[pipelines] Unsupported evaluate.backend: {backend}")
+
+    res = evaluator(
         pred_adata_or_path=pred_adata_or_path,
         true_adata_or_path=true_h5ad,
         pert_col=pert_col,
