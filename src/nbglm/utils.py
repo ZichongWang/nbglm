@@ -86,6 +86,12 @@ def get_logger(run_dir: str, name: str = "nbglm") -> logging.Logger:
     sh = logging.StreamHandler(sys.stdout)
     sh.setLevel(logging.INFO)
     sh.setFormatter(fmt)
+
+    class _NoWarningFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            return record.levelno != logging.WARNING
+
+    sh.addFilter(_NoWarningFilter())
     logger.addHandler(sh)
 
     # 文件
@@ -94,7 +100,7 @@ def get_logger(run_dir: str, name: str = "nbglm") -> logging.Logger:
     fh.setFormatter(fmt)
     logger.addHandler(fh)
 
-    logger.info(f"Logger initialized. Log file: {log_path}")
+    logger.debug(f"Logger initialized. Log file: {log_path}")
     return logger
 
 

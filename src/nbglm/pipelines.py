@@ -7,7 +7,7 @@
 此模块把各个功能模块（data_io / dataset / model / eval）进行**编排**，提供简洁的上层接口：
 - run_train(cfg, run_dirs)             -> {"model":..., "meta":..., "ckpt_path":...}
 - run_sample(cfg, run_dirs, ...)       -> {"pred_adata_path": 或 "pred_adata": AnnData}
-- run_evaluate(cfg, run_dirs, ...)     -> {"metrics": {...}}
+- run_evaluate(cfg, run_dirs, ...)     -> {"metrics_raw": {...}}
 - 组合模式：run_train_sample_eval / run_train_sample / run_sample_eval / run_sample / run_evaluate_only
 
 设计要点（Design Notes）
@@ -27,7 +27,7 @@ import time
 from numbers import Number
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
-
+import scanpy as sc
 import numpy as np
 import pandas as pd
 import anndata as ad
@@ -118,11 +118,80 @@ def _assign_devices(device_list: List[Optional[str]], count: int) -> List[Option
     return [normalized[i % len(normalized)] for i in range(count)]
 
 
+def _format_metrics_markdown(entries: List[Tuple[str, Dict[str, Any]]]) -> str:
+    """Render metrics into a Markdown table with fixed columns."""
+
+    def _to_float(value: Any) -> Optional[float]:
+        if isinstance(value, Number):
+            return float(value)
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    def _fmt(value: Optional[float]) -> str:
+        return f"{value:.4f}" if value is not None else "-"
+
+    header = "| seed | DES | PDS | MAE | Score |\n| --- | --- | --- | --- | --- |"
+    rows: List[str] = []
+    des_values, pds_values, mae_values, score_values = [], [], [], []
+
+    for seed_label, metrics in entries:
+        metrics = metrics or {}
+        des = _to_float(metrics.get("DES"))
+        pds = _to_float(metrics.get("PDS"))
+        mae = _to_float(metrics.get("MAE"))
+        score = _to_float(metrics.get("Score")) or _to_float(metrics.get("Overall"))
+        if score is None and None not in (des, pds, mae):
+            # Attempt to compute when possible using legacy baselines
+            des_base, pds_base, mae_base = 0.0761, 0.52, 0.0269
+            try:
+                des_scaled = max(0.0, min(1.0, ((des - des_base) / (1 - des_base)))) if des is not None else None
+                pds_scaled = max(0.0, min(1.0, ((pds - pds_base) / (1 - pds_base)))) if pds is not None else None
+                mae_scaled = max(0.0, min(1.0, ((mae_base - mae) / mae_base))) if mae is not None else None
+                if None not in (des_scaled, pds_scaled, mae_scaled):
+                    score = 100.0 * (des_scaled + pds_scaled + mae_scaled) / 3.0
+            except Exception:
+                score = None
+
+        if des is not None:
+            des_values.append(des)
+        if pds is not None:
+            pds_values.append(pds)
+        if mae is not None:
+            mae_values.append(mae)
+        if score is not None:
+            score_values.append(score)
+
+        row = f"| {seed_label} | {_fmt(des)} | {_fmt(pds)} | {_fmt(mae)} | {_fmt(score)} |"
+        rows.append(row)
+
+    # Calculate mean and standard deviation
+    def _mean_std(values: List[float]) -> Tuple[Optional[float], Optional[float]]:
+        if not values:
+            return None, None
+        mean = sum(values) / len(values)
+        variance = sum((x - mean) ** 2 for x in values) / len(values)
+        return mean, variance ** 0.5
+
+    des_mean, des_std = _mean_std(des_values)
+    pds_mean, pds_std = _mean_std(pds_values)
+    mae_mean, mae_std = _mean_std(mae_values)
+    score_mean, score_std = _mean_std(score_values)
+
+    # Add mean and standard deviation rows
+    rows.append(f"| Mean | {_fmt(des_mean)} | {_fmt(pds_mean)} | {_fmt(mae_mean)} | {_fmt(score_mean)} |")
+    rows.append(f"| Std Dev | {_fmt(des_std)} | {_fmt(pds_std)} | {_fmt(mae_std)} | {_fmt(score_std)} |")
+
+    return "\n".join([header, *rows])
+
+
 def _prepare_seed_executor_payload(
     cfg: dict,
     seed_int: int,
     base_mode: str,
     seed_dirs: Dict[str, str],
+    n_jobs_override: Optional[int] = None,
 ) -> dict:
     seed_cfg = copy.deepcopy(cfg)
     seed_cfg.setdefault("experiment", {})["seed"] = seed_int
@@ -131,6 +200,8 @@ def _prepare_seed_executor_payload(
     seed_cfg["pipeline"].pop("seeds", None)
     seed_cfg["pipeline"].pop("multi_seed_devices", None)
     seed_cfg["pipeline"].pop("multi_seed_max_workers", None)
+    if n_jobs_override is not None:
+        seed_cfg.setdefault("evaluate", {})["n_jobs"] = int(max(1, n_jobs_override))
     return seed_cfg
 
 
@@ -238,6 +309,8 @@ def _build_training_dataloader(cfg: dict, adata_all: ad.AnnData, adata_pert: ad.
     control_name = cfg["data"]["control_name"]
 
     # tensors
+    #* 测试theta用谁来估计对DE有多大影响
+    # X_all = dset.to_tensor(adata_all.X)          # [N_all, G] CPU
     X_pert = dset.to_tensor(adata_pert.X)          # [N, G] CPU
     X_ctrl = dset.to_tensor(adata_all[adata_all.obs[pert_col] == control_name].X)  # [N_ctrl, G]
 
@@ -249,6 +322,8 @@ def _build_training_dataloader(cfg: dict, adata_all: ad.AnnData, adata_pert: ad.
     # mu_control & theta
 
     mu_control = X_ctrl.mean(dim=0)
+    # adata_test = sc.read_h5ad("/home/wzc26/work/vcc/nbglm/data/Official_Data_Split/test.h5ad")
+    # X_test = dset.to_tensor(adata_test[adata_test.obs[pert_col] != control_name].X)
     theta_vec = dset.estimate_theta_per_gene(X_ctrl)
 
     # phase
@@ -525,8 +600,15 @@ def run_sample(
             global_probs = dset.compute_global_phase_probs(adata_all.obs[phase_col].tolist())
         else:
             global_probs = np.array([0.7, 0.15, 0.15], dtype=float)
-        per_pert_probs = dset.compute_per_pert_phase_probs(adata_pert, pert_col) if phase_strategy == "control" else None
-        phase_ids_list = dset.sample_validation_phases(df_val, phase_strategy, global_probs, per_pert_probs, seed=int(cfg["experiment"].get("seed", 2025)))
+        per_pert_probs = dset.compute_per_pert_phase_probs(adata_pert, pert_col, phase_col) if phase_strategy == "control" else None
+        phase_ids_list = dset.sample_validation_phases(
+            df_val,
+            phase_strategy,
+            global_probs,
+            per_pert_probs,
+            pert_col=pert_col,
+            seed=int(cfg["experiment"].get("seed", 2025)),
+        )
         phase_ids_test = torch.tensor(phase_ids_list, dtype=torch.long)
     else:
         phase_ids_test = None
@@ -550,7 +632,7 @@ def run_sample(
     obs_pred = pd.DataFrame({pert_col: [meta["perts_ordered"][i] for i in pert_ids_test_list]})
     if use_cycle and phase_ids_test is not None:
         inv_map = {0: "G1", 1: "S", 2: "G2M"}
-        obs_pred["phase"] = [inv_map.get(int(x), "G1") for x in phase_ids_test.tolist()]
+        obs_pred[phase_col] = [inv_map.get(int(x), "G1") for x in phase_ids_test.tolist()]
     # 预测集
     ad_pred = ad.AnnData(X=sampled_counts, obs=obs_pred, var=pd.DataFrame(index=meta["gene_names"]).copy())
     # control 原样附带（只用于评估一致性；如不需要可删掉这一 concat）
@@ -613,7 +695,20 @@ def run_evaluate(cfg: dict, run_dirs: Dict[str, str], pred_adata_or_path: Union[
         normalize=True,
         save_json=True,
     )
-    return {"metrics": res}
+    if "Score" not in res and "Overall" in res:
+        res["Score"] = res["Overall"]
+
+    seed_label = str(cfg.get("experiment", {}).get("seed", "NA"))
+    table = _format_metrics_markdown([(seed_label, res)])
+
+    metrics_dir = run_dirs["metrics_dir"]
+    os.makedirs(metrics_dir, exist_ok=True)
+    markdown_path = os.path.join(metrics_dir, "metrics.md")
+    with open(markdown_path, "w", encoding="utf-8") as f:
+        f.write(table + "\n")
+    logger.info("[eval] Markdown metrics written to %s", markdown_path)
+
+    return {"metrics_raw": res}
 
 
 # -----------------------------
@@ -657,6 +752,12 @@ def run_multi_seed(cfg: dict, run_dirs: Dict[str, str]) -> Dict[str, Any]:
         device_list,
     )
 
+    cpu_total = mp.cpu_count() or 1
+    max_total_cores = max(1, int(cpu_total * 0.9))
+    if max_workers > max_total_cores:
+        max_workers = max_total_cores
+    per_task_cpu = max(1, max_total_cores // max_workers) if max_workers > 0 else max_total_cores
+
     ctx = mp.get_context("spawn")
     future_map = {}
     seed_results: Dict[int, Dict[str, Any]] = {}
@@ -670,7 +771,7 @@ def run_multi_seed(cfg: dict, run_dirs: Dict[str, str]) -> Dict[str, Any]:
             device_assignments[seed_int] = visible_device
 
             seed_dirs = _make_child_run_dirs(run_dirs["run_dir"], f"seed_{seed_int}")
-            seed_cfg = _prepare_seed_executor_payload(cfg, seed_int, base_mode, seed_dirs)
+            seed_cfg = _prepare_seed_executor_payload(cfg, seed_int, base_mode, seed_dirs, n_jobs_override=per_task_cpu)
 
             future = executor.submit(_run_seed_job, seed_int, seed_cfg, seed_dirs, base_mode, visible_device)
             future_map[future] = (seed_int, seed_dirs)
@@ -683,19 +784,25 @@ def run_multi_seed(cfg: dict, run_dirs: Dict[str, str]) -> Dict[str, Any]:
                 logger.exception("[multi_seed] seed=%d 运行失败", seed_int)
                 raise
 
-            metrics = {}
-            if isinstance(result.get("metrics"), dict):
-                metrics = {k: float(v) for k, v in result["metrics"].items() if isinstance(v, Number)}
-            metrics_collection[seed_int] = metrics
+            metrics_raw = {}
+            raw_payload = result.get("metrics_raw")
+            if isinstance(raw_payload, dict):
+                metrics_raw = {k: float(v) for k, v in raw_payload.items() if isinstance(v, Number)}
+            metrics_collection[seed_int] = metrics_raw
 
-            run_entry: Dict[str, Any] = {"seed": seed_int, "run_dir": seed_dirs["run_dir"], "device": device_assignments[seed_int] or "cpu"}
+            run_entry: Dict[str, Any] = {
+                "seed": seed_int,
+                "run_dir": seed_dirs["run_dir"],
+                "device": device_assignments[seed_int] or "cpu",
+                "metrics": result.get("metrics"),
+                "metrics_raw": metrics_raw,
+            }
             for key, value in result.items():
-                if key == "metrics" and isinstance(result.get("metrics"), dict):
-                    run_entry[key] = metrics
-                else:
-                    run_entry[key] = value
+                if key in {"metrics", "metrics_raw"}:
+                    continue
+                run_entry[key] = value
             seed_results[seed_int] = run_entry
-            logger.info("[multi_seed] 完成 seed=%d", seed_int)
+            logger.info("[multi_seed] Finish seed=%d", seed_int)
 
     sorted_seeds = [int(s) for s in seeds]
     per_seed_runs = [seed_results[s] for s in sorted_seeds]
@@ -727,11 +834,20 @@ def run_multi_seed(cfg: dict, run_dirs: Dict[str, str]) -> Dict[str, Any]:
         json_dump(summary_path, summary_payload)
         logger.info("[multi_seed] 指标汇总写入 %s", summary_path)
 
+    table = _format_metrics_markdown([(str(seed), metrics_collection.get(seed, {})) for seed in sorted_seeds])
+    metrics_dir = run_dirs["metrics_dir"]
+    os.makedirs(metrics_dir, exist_ok=True)
+    markdown_path = os.path.join(metrics_dir, "metrics_summary.md")
+    with open(markdown_path, "w", encoding="utf-8") as f:
+        f.write(table + "\n")
+    logger.info("[multi_seed] Markdown metrics summary written to %s", markdown_path)
+
     return {
         "base_mode": base_mode,
         "seeds": sorted_seeds,
         "seed_runs": per_seed_runs,
         "aggregated_metrics": aggregated_metrics,
+        "metrics_raw": {seed: metrics_collection.get(seed, {}) for seed in sorted_seeds},
         "summary_path": summary_path,
     }
 

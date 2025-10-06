@@ -15,7 +15,7 @@
 - **解耦**：所有磁盘路径与 I/O 放在此模块，便于统一替换（例如改用 parquet/hdf5）。
 - **容错**：当某些基因/扰动在嵌入表中缺失时，使用零向量（zero vector）占位并警告。
 - **对齐**：嵌入按目标顺序输出，并提供 L2 归一化（row-wise L2 normalization）开关。
-
+Real AnnData
 依赖（Dependencies）
 -------------------
 - anndata, scanpy（用于 .h5ad 读写）
@@ -277,7 +277,7 @@ def save_config_snapshot(cfg: dict, out_dir: str, filename_yaml: str = "config.y
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
 
-    logger.info("已保存配置快照 -> %s", out_path)
+    logger.debug("Saved config snapshot -> %s", out_path)
 
 
 # -----------------------------

@@ -1,0 +1,13 @@
+anndata
+joblib
+numpy
+pandas
+pdex
+polars
+pyyaml
+scanpy
+scikit-learn
+scipy
+statsmodels
+torch
+tqdm

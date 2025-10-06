@@ -53,7 +53,7 @@ def ensure_norm_log(adata: ad.AnnData, allow_discrete: bool, label: str) -> None
     if allow_discrete:
         logger.info("%s contains integer counts; leaving data as-is (allow_discrete)", label)
         return
-    logger.info("Normalizing and log-transforming %s", label)
+    logger.debug("Normalizing and log-transforming %s", label)
     sc.pp.normalize_total(adata=adata, inplace=True)
     sc.pp.log1p(adata)
 
@@ -181,7 +181,7 @@ class PerturbationPair:
     def _build_bulk(self, adata: ad.AnnData) -> tuple[np.ndarray, np.ndarray]:
         matrix = adata.X
         if issparse(matrix):
-            logger.info("Converting sparse matrix to dense for pseudobulk computation")
+            logger.debug("Converting sparse matrix to dense for pseudobulk computation")
             matrix = matrix.toarray()  # type: ignore[attr-defined]
         frame = pl.DataFrame(matrix).with_columns(
             pl.Series("groupby_key", adata.obs[self.pert_col].to_numpy(str))

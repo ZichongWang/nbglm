@@ -70,9 +70,9 @@ evaluate:
 
 pipeline:
   mode: multi_seed
-  seeds: [123, 42, 2025, 3704]
-  multi_seed_devices: [0, 1, 2, 3]     # optional GPU mapping per worker
-  multi_seed_max_workers: 4            # optional cap on concurrent workers
+  seeds: [123, 42, 2025, 3407, 9124]
+  multi_seed_devices: [3, 4, 5, 6, 7]     # optional GPU mapping per worker
+  multi_seed_max_workers: 5            # optional cap on concurrent workers
   persist_intermediate: true           # must stay true so each worker writes outputs
   multi_seed_base_mode: train_sample_eval
 # pipeline:

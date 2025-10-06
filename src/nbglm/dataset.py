@@ -239,7 +239,11 @@ def compute_global_phase_probs(phases: List[str]) -> np.ndarray:
     return counts / total
 
 
-def compute_per_pert_phase_probs(adata_pert: ad.AnnData, pert_name_col: str) -> Dict[str, np.ndarray]:
+def compute_per_pert_phase_probs(
+    adata_pert: ad.AnnData,
+    pert_name_col: str,
+    phase_col: str = "phase",
+) -> Dict[str, np.ndarray]:
     """
     计算**按扰动**的 phase 概率，用于 `phase_strategy="control"`。
 
@@ -255,10 +259,13 @@ def compute_per_pert_phase_probs(adata_pert: ad.AnnData, pert_name_col: str) -> 
     Dict[str, np.ndarray]
         {pert_name: [pG1, pS, pG2M]}
     """
-    df = adata_pert.obs[[pert_name_col, "phase"]].copy()
+    if phase_col not in adata_pert.obs.columns:
+        # fall back to default column name if missing
+        phase_col = "phase"
+    df = adata_pert.obs[[pert_name_col, phase_col]].copy()
     out: Dict[str, np.ndarray] = {}
     for name, sub in df.groupby(pert_name_col):
-        out[name] = compute_global_phase_probs(sub["phase"].tolist())
+        out[name] = compute_global_phase_probs(sub[phase_col].tolist())
     return out
 
 
@@ -267,7 +274,8 @@ def sample_validation_phases(
     phase_strategy: str,
     global_probs: np.ndarray,
     per_pert_probs: Optional[Dict[str, np.ndarray]],
-    seed: int = 2025
+    pert_col: str = "target_gene",
+    seed: int = 2025,
 ) -> List[int]:
     """
     为验证集**按策略**生成 phase 序列（与 df_val 展开顺序一致）。
@@ -288,7 +296,7 @@ def sample_validation_phases(
     rng = np.random.default_rng(seed)
     out: List[int] = []
     for _, row in df_val.iterrows():
-        pert = str(row["target_gene"])
+        pert = str(row[pert_col])
         n = int(row["n_cells"])
         if phase_strategy in ("ignore", "fixed_G1"):
             out.extend([PHASE2ID["G1"]] * n)
@@ -457,8 +465,8 @@ def build_pseudobulk(
     N, G = X_pert_train.shape
     lib_all = X_pert_train.sum(dim=1)
 
-    unique_perts, inverse_indices = torch.unique(pert_ids_train, return_inverse=True)  # [K], [N]
-    K = unique_perts.numel()
+    unique_perts, inverse_indices = torch.unique(pert_ids_train, return_inverse=True)  # [K], [N]. inverse_indices is in 0..K-1
+    K = unique_perts.numel() # number of unique perts
 
     if not use_cycle:
         Y_sum = torch.zeros(K, G, dtype=torch.float32)
@@ -493,7 +501,7 @@ def build_pseudobulk(
         counts = torch.zeros(K, 3, dtype=torch.long)
         lib_sum = torch.zeros(K, 3, dtype=torch.float32)
 
-        for start in tqdm(range(0, N, batch_size), desc="构建 pseudo-bulk by phase (CPU)"):
+        for start in range(0, N, batch_size):
             end = min(start + batch_size, N)
             Xb = X_pert_train[start:end]
             invb = inverse_indices[start:end]
@@ -511,11 +519,13 @@ def build_pseudobulk(
                     lib_sum[:, ph].index_add_(0, idxp, lsub)
                     counts[:, ph].index_add_(0, idxp, torch.ones_like(idxp, dtype=torch.long))
 
-        counts = counts.clamp_min(1)
-        Y_avg = Y_sum / counts.unsqueeze(2)  # [K, 3, G]
+        # 计算有效掩码（基于原始计数），并用安全分母求均值
+        mask = counts > 0
+        counts_safe = counts.clamp_min(1)
+        Y_avg = Y_sum / counts_safe.unsqueeze(2)  # [K, 3, G]
 
         # 摊平成有效条目
-        mask_flat = (counts > 0).reshape(-1)              # [K*3]
+        mask_flat = mask.reshape(-1)              # [K*3]
         Y_flat = Y_avg.reshape(K * 3, G)
         sel_idx = torch.nonzero(mask_flat, as_tuple=False).squeeze(1)
 
@@ -528,7 +538,7 @@ def build_pseudobulk(
 
         if use_sf:
             lib_flat = lib_sum.reshape(K * 3)
-            cnt_flat = counts.reshape(K * 3).to(torch.float32)
+            cnt_flat = counts_safe.reshape(K * 3).to(torch.float32)
             mean_lib_flat = (lib_flat / cnt_flat.clamp_min(1.0)).index_select(0, sel_idx)
             s_eff = (mean_lib_flat / ref_depth).clamp_min(1e-12)
             log_s_eff = torch.log(s_eff)

@@ -2,10 +2,6 @@
 
 A small, configuration-driven project structure for **Low-Rank NB-GLM** on perturb-seq style data.
 
-> 目标（Goal）  
-> 将单脚本重构为**简洁可维护**的小型工程，配置（YAML）驱动，入口统一（`python run.py`），
-> 支持“训练 + 采样 + 评估”等组合流程，并为后续 **k-fold CV**、**内存直连评估（采样→评估）** 留好接口。
-
 ---
 
 ## Run eval

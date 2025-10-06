@@ -127,7 +127,7 @@ def main():
     else:
         raise ValueError(f"[run] 未知 pipeline.mode: {mode}")
 
-    logger.info(f"Done. Summary: {json.dumps(out, ensure_ascii=False, indent=2, default=anndata_to_dict)}")
+    logger.info("Done. Run artifacts written under %s", run_dirs["run_dir"])
 
 
 if __name__ == "__main__":
