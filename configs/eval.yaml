@@ -5,7 +5,7 @@
 # 如需修改，请尽量维持结构不变，仅改数值。
 
 experiment:
-  name: "baseline_nbglm"   # 本次实验名（用于输出目录命名）
+  name: "eval_not_preserve_total"   # 本次实验名（用于输出目录命名）
   seed: 2025               # 全局随机种子
   device: "auto"           # "auto" | "cpu" | "cuda" | "cuda:0" ...
 
@@ -27,7 +27,7 @@ paths:
   outputs_root: "./outputs"
 
   # （可选）仅评估模式时指定已有预测文件：
-  # pred_h5ad: "./outputs/your_run/preds/pred.h5ad"
+  pred_h5ad: "/home/wzc26/work/vcc/nbglm/tools/test_nb_per_pert_no_preserve_total.h5ad"
 
 data:
   pert_name_col: "target_gene"   # 扰动列名
@@ -41,8 +41,8 @@ model:
   losses:
     primary: "MSE"               # ["MSE","NB","POIS_DEV","NB_DEV","MSE_LOG1P","MSE_ANS"]
   regularization:
-    l1: 0
-    l2: 0
+    l1: 1e-3
+    l2: 5e-4
 
 train:
   fit_mode: "concise"            # ["concise","whole"]；concise=伪批训练（更省显存）
@@ -54,7 +54,7 @@ size_factor:
   use_sf: true                   # 是否在训练与采样使用 size factor 作为 offset（log_s）
 
 sampling:
-  sampler: "nb"             # ["poisson","nb","gp_mixture"]
+  sampler: "gp_mixture"             # ["poisson","nb","gp_mixture"]
   batch_size: 4096
   gamma_heterogeneity:
     enable: false                 # 是否在采样时引入 Gamma(r0,r0) 细胞级异质性
@@ -69,7 +69,7 @@ evaluate:
   true_de_cache: "./data/test_de_cache"  # 预计算的真实 DE 缓存路径（文件或目录）
 
 pipeline:
-  mode: "train_sample_eval"      # ["train_sample_eval","train_sample","sample_eval","sample","evaluate_only", "real"]
+  mode: "evaluate_only"      # ["train_sample_eval","train_sample","sample_eval","sample","evaluate_only", "real"]
   persist_intermediate: true     # true: 保存 ckpt/pred 文件；false: 采样→评估内存直连
   # pretrained_ckpt: "./outputs/xxx/ckpt/model.pt"  # 当 mode=sample 或 sample_eval 时从该权重采样
   # seeds: [2025, 2026, 2027]      # 当 mode=multi_seed 时需提供的随机种子列表

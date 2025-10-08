@@ -209,3 +209,28 @@ marimo/_lsp/
 __marimo__/
 /data
 /outputs
+
+# NBGLM project-specific artifacts
+# Ignore all CSV and H5AD as requested
+*.csv
+*.h5ad
+
+# Results and run directories
+results/
+**/ckpt/
+**/preds/
+**/metrics/
+**/logs/
+
+# Model/checkpoint & large binary artifacts
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.npz
+*.npy
+
+# Experiment trackers (optional but common)
+wandb/
+mlruns/
+.tensorboard/

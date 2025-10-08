@@ -1,0 +1,78 @@
+# =========================
+# nbglm: default.yaml
+# =========================
+# 约定：所有键名与 src/nbglm/* 中的代码严格对齐。
+# 如需修改，请尽量维持结构不变，仅改数值。
+
+experiment:
+  name: "poisson_reg_test"   # 本次实验名（用于输出目录命名）
+  seed: 2025               # 全局随机种子
+  device: "auto"           # "auto" | "cpu" | "cuda" | "cuda:0" ...
+
+paths:
+  # 训练 / 评估数据路径（请按你的实际目录修改）
+  train_h5ad: "./data/adata_pp.h5ad"
+  train_split_h5ad: "./data/Official_Data_Split/train.h5ad"  # 当 data.use_split=true 时优先
+  test_h5ad: "./data/Official_Data_Split/test.h5ad"          # 评估时真实标签
+  val_list_csv: "./data/Official_Data_Split/test_pert_info.csv"  # 采样清单：target_gene, n_cells, median_umi_per_cell
+  train_h5ad_real: "./data/adata_pp.h5ad"  
+  val_list_csv_real: "./data/pert_counts_Validation.csv"  # 用于真实数据采样的清单
+  ctrl_h5ad: "./data/adata_ctrl.h5ad" 
+
+  # 嵌入（embeddings）
+  gene_embedding_csv: "./data/PCA_gene_embedding_512D.csv"
+  pert_embedding_csv: "./data/perturbation_embedding_P_512D_cpu.csv"
+
+  # 输出根目录（run 子目录将自动生成）
+  outputs_root: "./outputs"
+
+  # （可选）仅评估模式时指定已有预测文件：
+  # pred_h5ad: "./outputs/your_run/preds/pred.h5ad"
+
+data:
+  pert_name_col: "target_gene"   # 扰动列名
+  control_name: "non-targeting"  # 控制组名（将被放至扰动列表首位）
+  use_split: true                # true: 使用 train_split_h5ad；false: 使用 train_h5ad
+  phase_column: "phase"          # 细胞周期列名（G1/S/G2M），仅在 model.use_cycle=true 时使用
+
+model:
+  name: "lowrank_nb_glm"         # 目前仅此模型；为未来扩展做占位
+  use_cycle: false                # 是否在 log-mean 中加入 S/G2M 固定效应（G1 基线）
+  losses:
+    primary: "MSE"               # ["MSE","NB","POIS_DEV","NB_DEV","MSE_LOG1P","MSE_ANS"]
+  regularization:
+    l1: 1e-6
+    l2: 0
+
+train:
+  fit_mode: "concise"            # ["concise","whole"]；concise=伪批训练（更省显存）
+  lr: 5e-4
+  epochs: 100
+  batch_size: 2048               # dataloader 基础批大小（内部会做些调整）
+
+size_factor:
+  use_sf: true                   # 是否在训练与采样使用 size factor 作为 offset（log_s）
+
+sampling:
+  sampler: "poisson"             # ["poisson","nb","gp_mixture"]
+  batch_size: 4096
+  gamma_heterogeneity:
+    enable: false                 # 是否在采样时引入 Gamma(r0,r0) 细胞级异质性
+    r0: 50.0
+  phase_strategy: "global"       # ["ignore","global","control","fixed_G1","fixed_S","fixed_G2M"]
+
+evaluate:
+  enable: true
+  backend: "vcc"             # "legacy" uses src/nbglm/eval.py, "vcc" uses src/nbglm/vcc_eval.py
+  metrics: ["MAE", "PDS", "DES"] # 需要的指标子集
+  n_jobs: "auto"                 # DES 并行核数（"auto" uses up to 90% of available cores）
+  true_de_cache: "./data/test_de_cache"  # 预计算的真实 DE 缓存路径（文件或目录）
+
+pipeline:
+  mode: "train_sample_eval"      # ["train_sample_eval","train_sample","sample_eval","sample","evaluate_only", "real"]
+  persist_intermediate: true     # true: 保存 ckpt/pred 文件；false: 采样→评估内存直连
+  # pretrained_ckpt: "./outputs/xxx/ckpt/model.pt"  # 当 mode=sample 或 sample_eval 时从该权重采样
+  # seeds: [2025, 2026, 2027]      # 当 mode=multi_seed 时需提供的随机种子列表
+  # multi_seed_base_mode: "train_sample_eval"  # multi_seed 模式下，逐个种子执行的内部模式
+  # multi_seed_devices: [0, 1, 2, 3]  # 可选：为每个子任务分配 GPU（留空则继承当前可见设备）
+  # multi_seed_max_workers: 4         # 可选：并发进程上限（默认=设备数量或种子数）
