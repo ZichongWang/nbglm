@@ -3,6 +3,23 @@
 A small, configuration-driven project structure for **Low-Rank NB-GLM** on perturb-seq style data.
 
 ---
+## Quick start
+1. Manually split dataset(code not provided). I split the training dataset, 120 perts for training (`train.h5ad`), 30 perts for testing(`test.h5ad`). Keep control cells in both files. And create a csv file containing pert, cell num, median UMI(`test_pert_info.csv`).
+2. Run 
+   ```
+   python tools/vcc_build_ground_truth_cache.py \
+         --real /path/to/test.h5ad \
+         --output /path/to/output
+   ```
+   The output is a folder, contains three files. Use `data/test_de_cache` as example.
+
+3. Modify configs. Use `configs/multi_seed_poisson.yaml` as example, which is the most frequent config file I use.
+   + Set `paths.training_h5ad` as the file VCC official provide.
+   + Set `paths.train_split_h5ad` as `path/to/train.h5ad`
+   + Set `paths.test_h5ad` as `path/to/test.h5ad`
+   + Set `paths.val_list_csv` as `path/to/test_pert_info.csv`
+   + The rest three path configs are easy to understand.
+   + Set `evaluate.true_de_cache` as `data/test_de_cache`.
 
 ## Run eval
 ```

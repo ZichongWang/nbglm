@@ -41,7 +41,7 @@ model:
   losses:
     primary: "MSE"               # ["MSE","NB","POIS_DEV","NB_DEV","MSE_LOG1P","MSE_ANS"]
   regularization:
-    l1: 1e-6
+    l1: 0
     l2: 0
 
 train:

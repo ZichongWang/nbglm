@@ -21,7 +21,8 @@ mkdir -p "${OUT_GROUP_DIR}"
 echo "[sweep] Group folder: ${OUT_GROUP_DIR}"
 
 # Search grids (edit as needed)
-L1_VALUES=(0 1e-6 1e-5 1e-4 5e-4 1e-3)
+# L1_VALUES=(0 1e-6 1e-5 1e-4 5e-4 1e-3)
+L1_VALUES=(8e-4 5e-3 1e-2)
 L2_VALUES=(0 1e-6 1e-5 5e-5 1e-4 5e-4 1e-3)
 
 for l1 in "${L1_VALUES[@]}"; do

@@ -20,8 +20,8 @@ paths:
   ctrl_h5ad: "./data/adata_ctrl.h5ad" 
 
   # 嵌入（embeddings）
-  gene_embedding_csv: "./data/PCA_gene_embedding_512D.csv"
-  pert_embedding_csv: "./data/perturbation_embedding_P_512D_cpu.csv"
+  gene_embedding_csv: "./data/embeddings/PCA_gene_embedding_512D.csv"
+  pert_embedding_csv: "./data/embeddings/perturbation_embedding_P_512D_cpu.csv"
 
   # 输出根目录（run 子目录将自动生成）
   outputs_root: "./outputs"

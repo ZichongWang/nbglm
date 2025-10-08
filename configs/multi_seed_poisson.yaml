@@ -5,7 +5,7 @@
 # 如需修改，请尽量维持结构不变，仅改数值。
 
 experiment:
-  name: "multi_seed_poisson"   # 本次实验名（用于输出目录命名）
+  name: "poisson_SCG_GO_embedding"   # 本次实验名（用于输出目录命名）
   seed: 2025               # 全局随机种子
   device: "auto"           # "auto" | "cpu" | "cuda" | "cuda:0" ...
 
@@ -20,8 +20,8 @@ paths:
   ctrl_h5ad: "./data/adata_ctrl.h5ad" 
 
   # 嵌入（embeddings）
-  gene_embedding_csv: "./data/PCA_gene_embedding_512D.csv"
-  pert_embedding_csv: "./data/perturbation_embedding_P_512D_cpu.csv"
+  gene_embedding_csv: "./data/embeddings/SCG_GOall_concat_Gene_512.csv"
+  pert_embedding_csv: "./data/embeddings/SCG_GOall_concat_Pert_512.csv"
 
   # 输出根目录（run 子目录将自动生成）
   outputs_root: "./outputs"
