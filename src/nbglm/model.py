@@ -193,6 +193,7 @@ class LowRankNB_GLM(nn.Module):
         gp_activation: Optional[nn.Module] = None,
         gp_dropout: float = 0.0,
         gp_norm: Literal["none", "batchnorm", "layernorm"] = "none",
+        residual_init: float = 0.2
     ):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -206,21 +207,28 @@ class LowRankNB_GLM(nn.Module):
         n_genes, d_g = self.G.shape
         _, d_p = self.P.shape
 
-        self.g_mlp, d_g_out = build_mlp(
-            in_dim=d_g, hidden_dims=g_mlp_hidden, out_dim=g_out_dim,
-            activation=gp_activation, dropout=gp_dropout, norm=gp_norm
-        )
-        self.p_mlp, d_p_out = build_mlp(
-            in_dim=d_p, hidden_dims=p_mlp_hidden, out_dim=p_out_dim,
-            activation=gp_activation, dropout=gp_dropout, norm=gp_norm
-        )
+        # self.g_mlp, d_g_out = build_mlp(
+        #     in_dim=d_g, hidden_dims=g_mlp_hidden, out_dim=g_out_dim,
+        #     activation=gp_activation, dropout=gp_dropout, norm=gp_norm
+        # )
+        # self.p_mlp, d_p_out = build_mlp(
+        #     in_dim=d_p, hidden_dims=p_mlp_hidden, out_dim=p_out_dim,
+        #     activation=gp_activation, dropout=gp_dropout, norm=gp_norm
+        # )
+        self.g_mlp = nn.Sequential(nn.Linear(d_g, d_g, bias=False), nn.LayerNorm(d_g), nn.GELU(), nn.Dropout(gp_dropout)) 
+        self.p_mlp = nn.Sequential(nn.Linear(d_p, d_p, bias=False), nn.LayerNorm(d_p), nn.GELU(), nn.Dropout(gp_dropout))
         self.g_mlp.to(self.device)
         self.p_mlp.to(self.device)
+
+        d_g_out = d_g if g_out_dim is None else g_out_dim
+        d_p_out = d_p if p_out_dim is None else p_out_dim
 
         # 可学习参数
         self.K = nn.Parameter(torch.empty(d_g_out, d_p_out, device=self.device))
         self.bias = nn.Parameter(torch.empty(n_genes, device=self.device))
         self.delta_log_mu_scaler = nn.Parameter(torch.tensor(2.5, device=self.device))
+        self.G_scaler = nn.Parameter(torch.tensor(residual_init, device=self.device))
+        self.P_scaler = nn.Parameter(torch.tensor(residual_init, device=self.device))
         if self.use_cycle:
             self.beta_cycle = nn.Parameter(torch.zeros(n_genes, 2, device=self.device))  # (S, G2M)
         else:
@@ -238,7 +246,7 @@ class LowRankNB_GLM(nn.Module):
         pert_ids: torch.LongTensor,                        # [B]
         phase_ids: Optional[torch.LongTensor] = None,      # [B] in {0,1,2}
         offset_log_s: Optional[torch.Tensor] = None        # [B]
-    ) -> torch.Tensor:
+    )  -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         前向传播（Forward）。输出**观测尺度**的均值 `mu_pred`（非对数），形状 [B, n_g]。
 
@@ -265,9 +273,9 @@ class LowRankNB_GLM(nn.Module):
             [B, n_g] 的观测尺度均值（已 clamp 到 [1e-10, 1e7]）。
         """
         # 选择扰动嵌入并计算低秩项
-        G_t = self.g_mlp(self.G)                       # [n_g, d_g']
+        G_t = self.g_mlp(self.G) + self.G_scaler * self.G                       # [n_g, d_g']
         P_sel = self.P[pert_ids]                       # [B, d_p]
-        P_t = self.p_mlp(P_sel)                        # [B, d_p']
+        P_t = self.p_mlp(P_sel) + self.P_scaler * P_sel                       # [B, d_p']
         raw = (G_t @ self.K @ P_t.T).T + self.bias.unsqueeze(0)  # [B, n_g]
         delta_log_mu = self.delta_log_mu_scaler * torch.tanh(raw)     # [B, n_g]
 
@@ -285,7 +293,8 @@ class LowRankNB_GLM(nn.Module):
             log_mu = log_mu + offset_log_s.unsqueeze(1)
 
         mu_pred = torch.exp(log_mu)
-        return torch.clamp(mu_pred, min=1e-10, max=1e7)
+        mu_pred = torch.clamp(mu_pred, min=1e-10, max=1e7)
+        return (mu_pred, raw)
 
     # -------------------------
     # 训练接口
@@ -304,6 +313,8 @@ class LowRankNB_GLM(nn.Module):
         lr_schedule_type: str = "cosine",
         lr_warmup_pct: float = 0.05,
         lr_min: float = 1e-5,
+        raw_l1_lambda: float = 0.0,
+        raw_l2_lambda: float = 0.0,
     ) -> None:
         """
         统一训练循环（Unified training loop）。
@@ -396,7 +407,7 @@ class LowRankNB_GLM(nn.Module):
                     phase = phase.to(self.device)
 
                 optimizer.zero_grad()
-                mu_pred = self.forward(pert, phase, offset_log_s=log_s)
+                mu_pred, raw = self.forward(pert, phase, offset_log_s=log_s)
 
                 if needs_theta:
                     loss = loss_fn_wt(mu_pred, y_true, self.theta)
@@ -404,8 +415,10 @@ class LowRankNB_GLM(nn.Module):
                     loss = loss_fn(mu_pred, y_true)
 
                 # 正则项（对 K）
-                reg = l1_lambda * self.K.abs().sum() + l2_lambda * (self.K ** 2).sum()
-                loss = loss + reg
+                K_reg = l1_lambda * self.K.abs().mean() + l2_lambda * (self.K.pow(2)).mean()
+                # 额外正则：对 pre-activation 'raw' 做 L1/L2（batch 均值，避免批大小敏感）
+                raw_reg = raw_l1_lambda * raw.abs().mean() + raw_l2_lambda * (raw.pow(2)).mean()
+                loss = loss + K_reg + raw_reg
 
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)

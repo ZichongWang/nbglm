@@ -329,6 +329,7 @@ def _instantiate_model(cfg: dict, G: torch.Tensor, P: torch.Tensor, mu_control: 
         theta_per_gene=theta_vec,
         use_cycle=use_cycle,
         **mlp_kwargs,
+        residual_init=cfg.get("model", {}).get("residual_init", 0.2)
     )
     return net
 
@@ -391,6 +392,8 @@ def run_train(cfg: dict, run_dirs: Dict[str, str]) -> Dict[str, Any]:
         lr_schedule_type=lr_schedule_type,
         lr_warmup_pct=lr_warmup_pct,
         lr_min=lr_min,
+        raw_l1_lambda=float(cfg["model"]["regularization"].get("raw_l1", 0.0)),
+        raw_l2_lambda=float(cfg["model"]["regularization"].get("raw_l2", 0.0)),
     )
 
     # 可选：保存 ckpt（包含必要常量，保证采样期无需再读 embeddings）
