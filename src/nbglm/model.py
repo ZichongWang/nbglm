@@ -500,7 +500,7 @@ class LowRankNB_GLM(nn.Module):
             else:
                 log_sfb = None
 
-            mu_obs = self.forward(pids, ph, offset_log_s=log_sfb)  # [B, n_g]
+            mu_obs, raw = self.forward(pids, ph, offset_log_s=log_sfb)  # [B, n_g]
 
             # Gamma 异质性（每 cell 一个缩放因子，均值=1，方差=1/r0）
             if use_gamma:
