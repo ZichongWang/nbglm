@@ -5,7 +5,7 @@
 # 如需修改，请尽量维持结构不变，仅改数值。
 
 experiment:
-  name: "baseline_nbglm"   # 本次实验名（用于输出目录命名）
+  name: "gpm_default"   # 本次实验名（用于输出目录命名）
   seed: 2025               # 全局随机种子
   device: "auto"           # "auto" | "cpu" | "cuda" | "cuda:0" ...
 
@@ -20,8 +20,8 @@ paths:
   ctrl_h5ad: "./data/adata_ctrl.h5ad" 
 
   # 嵌入（embeddings）
-  gene_embedding_csv: "./data/PCA_gene_embedding_512D.csv"
-  pert_embedding_csv: "./data/perturbation_embedding_P_512D_cpu.csv"
+  gene_embedding_csv: "./data/embeddings/PCA_gene_embedding_512D.csv"
+  pert_embedding_csv: "./data/embeddings/perturbation_embedding_P_512D_cpu.csv"
 
   # 输出根目录（run 子目录将自动生成）
   outputs_root: "./outputs"
@@ -41,8 +41,8 @@ model:
   losses:
     primary: "MSE"               # ["MSE","NB","POIS_DEV","NB_DEV","MSE_LOG1P","MSE_ANS"]
   regularization:
-    l1: 1e-3
-    l2: 5e-4
+    l1: 0
+    l2: 0
 
 train:
   fit_mode: "concise"            # ["concise","whole"]；concise=伪批训练（更省显存）
@@ -70,7 +70,7 @@ evaluate:
 
 pipeline:
   mode: "train_sample_eval"      # ["train_sample_eval","train_sample","sample_eval","sample","evaluate_only", "real"]
-  persist_intermediate: true     # true: 保存 ckpt/pred 文件；false: 采样→评估内存直连
+  persist_intermediate: false     # true: 保存 ckpt/pred 文件；false: 采样→评估内存直连
   # pretrained_ckpt: "./outputs/xxx/ckpt/model.pt"  # 当 mode=sample 或 sample_eval 时从该权重采样
   # seeds: [2025, 2026, 2027]      # 当 mode=multi_seed 时需提供的随机种子列表
   # multi_seed_base_mode: "train_sample_eval"  # multi_seed 模式下，逐个种子执行的内部模式

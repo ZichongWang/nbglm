@@ -18,6 +18,7 @@ from typing import Dict, Iterator, List, Optional, Union
 
 import anndata as ad
 import numpy as np
+import pandas as pd
 import polars as pl
 import scanpy as sc
 from pdex import parallel_differential_expression
@@ -537,7 +538,7 @@ def evaluate(
 
     results: Dict[str, float] = {}
     wanted = {m.upper() for m in metrics}
-
+    
     if "MAE" in wanted:
         mae_scores = compute_mae(pair)
         value = float(np.mean(list(mae_scores.values()))) if mae_scores else 0.0
@@ -550,31 +551,16 @@ def evaluate(
         results["PDS"] = value
         logger.info("[vcc_eval] PDS: %.6f", value)
 
-    if "DES" in wanted:
-        workers = _resolve_workers(n_jobs)
-        logger.info("[vcc_eval] Computing DES with %d workers", workers)
-        with pl.StringCache():
-            if cache_info is not None:
-                real_de_path = cache_info["real_de_path"]  # type: ignore[index]
-                real_de = sanitize_de_results(pl.read_parquet(real_de_path))  # type: ignore[arg-type]
-            else:
-                real_de = sanitize_de_results(
-                    compute_pdex(
-                        real,
-                        control=control_name,
-                        pert_col=pert_col,
-                        de_method=de_method,
-                        num_workers=workers,
-                        batch_size=batch_size,
-                    )
-                )
-            required_targets = {str(p) for p in pair.perts}
-            required_targets.add(control_name)
-            real_de = real_de.filter(pl.col("target").is_in(list(required_targets)))
-
-            pred_de = sanitize_de_results(
+    # Always compute DE frames (for CSV export and potential DES computation)
+    workers = _resolve_workers(n_jobs)
+    with pl.StringCache():
+        if cache_info is not None:
+            real_de_path = cache_info["real_de_path"]  # type: ignore[index]
+            real_de = sanitize_de_results(pl.read_parquet(real_de_path))  # type: ignore[arg-type]
+        else:
+            real_de = sanitize_de_results(
                 compute_pdex(
-                    pred,
+                    real,
                     control=control_name,
                     pert_col=pert_col,
                     de_method=de_method,
@@ -582,8 +568,28 @@ def evaluate(
                     batch_size=batch_size,
                 )
             )
-            pred_de = pred_de.filter(pl.col("target").is_in(list(required_targets)))
+        # For DES we include control; for CSV we will filter to perts only later
+        required_targets_all = {str(p) for p in pair.perts}
+        required_targets_all.add(control_name)
+        real_de = real_de.filter(pl.col("target").is_in(list(required_targets_all)))
 
+        pred_de = sanitize_de_results(
+            compute_pdex(
+                pred,
+                control=control_name,
+                pert_col=pert_col,
+                de_method=de_method,
+                num_workers=workers,
+                batch_size=batch_size,
+            )
+        )
+        pred_de = pred_de.filter(pl.col("target").is_in(list(required_targets_all)))
+
+
+
+    if "DES" in wanted:
+        logger.info("[vcc_eval] Computing DES with %d workers", workers)
+        # Use precomputed and filtered DE frames
         overlap_scores = compute_overlap_at_n(real_de, pred_de, pair.perts, k=None, metric="overlap", fdr_threshold=None)
         value = float(np.mean(list(overlap_scores.values()))) if overlap_scores else 0.0
         results["DES"] = value
@@ -608,6 +614,198 @@ def evaluate(
         overall_wo_mae = (des_scaled + pds_scaled) * (100.0 / 3.0)
         results["Overall_wo_MAE"] = overall_wo_mae
         logger.info("[vcc_eval] Overall score (DES+PDS): %.6f", overall_wo_mae)
+
+    # Export full DE table (per perturbation x gene) for both ground truth and prediction
+    if run_dir is not None:
+        try:
+            # Filter export to perturbations only (exclude control)
+            export_targets = [str(p) for p in pair.perts]
+            real_export = (
+                real_de
+                .filter(pl.col("target").is_in(export_targets))
+                .select(["feature", "target", "p_value", "fdr", "log2_fold_change"])
+                .rename({
+                    "feature": "gene",
+                    "target": "pert",
+                    "p_value": "gt_pvals",
+                    "fdr": "gt_fdr",
+                    "log2_fold_change": "gt_logfoldchanges",
+                })
+            )
+            pred_export = (
+                pred_de
+                .filter(pl.col("target").is_in(export_targets))
+                .select(["feature", "target", "p_value", "fdr", "log2_fold_change"])
+                .rename({
+                    "feature": "gene",
+                    "target": "pert",
+                    "p_value": "prediction_pvals",
+                    "fdr": "prediction_fdr",
+                    "log2_fold_change": "prediction_logfoldchanges",
+                })
+            )
+
+            merged = real_export.join(pred_export, on=["gene", "pert"], how="outer")
+            merged = merged.with_columns([
+                (pl.col("gt_fdr") < 0.05).alias("gt_significant"),
+                (pl.col("prediction_fdr") < 0.05).alias("pred_significant"),
+            ])
+            merged = merged.with_columns([
+                pl.col("gt_significant").fill_null(False),
+                pl.col("pred_significant").fill_null(False),
+            ])
+            merged = merged.select([
+                "gene",
+                "pert",
+                "gt_pvals",
+                "gt_fdr",
+                "gt_logfoldchanges",
+                "prediction_pvals",
+                "prediction_fdr",
+                "prediction_logfoldchanges",
+                "gt_significant",
+                "pred_significant",
+            ])
+
+            merged_pd = merged.to_pandas()
+            merged_pd["gt_significant"] = merged_pd["gt_significant"].astype(bool)
+            merged_pd["pred_significant"] = merged_pd["pred_significant"].astype(bool)
+
+            def _safe_div(a: int, b: int) -> float:
+                return float(a) / float(b) if b else 0.0
+
+            tp = int(np.logical_and(merged_pd["pred_significant"], merged_pd["gt_significant"]).sum())
+            fp = int(np.logical_and(merged_pd["pred_significant"], ~merged_pd["gt_significant"]).sum())
+            fn = int(np.logical_and(~merged_pd["pred_significant"], merged_pd["gt_significant"]).sum())
+            tn = int(np.logical_and(~merged_pd["pred_significant"], ~merged_pd["gt_significant"]).sum())
+
+            total = tp + fp + fn + tn
+            rejections = tp + fp
+            true_nulls = tn + fp
+
+            precision = _safe_div(tp, tp + fp)
+            recall = _safe_div(tp, tp + fn)
+            fdr = _safe_div(fp, tp + fp)
+            fnr = _safe_div(fn, tp + fn)
+            accuracy = _safe_div(tp + tn, total)
+            f1 = 0.0
+            if (tp + fp) and (tp + fn):
+                precision_safe = precision
+                recall_safe = recall
+                denom = precision_safe + recall_safe
+                if denom:
+                    f1 = 2 * (precision_safe * recall_safe) / denom
+
+            overall_payload = {
+                "TP": tp,
+                "FP": fp,
+                "FN": fn,
+                "TN": tn,
+                "m": total,
+                "R": rejections,
+                "m0": true_nulls,
+                "Precision": precision,
+                "Recall": recall,
+                "FDR": fdr,
+                "FNR": fnr,
+                "Accuracy": accuracy,
+                "F1": f1,
+            }
+
+            results.update({
+                "DE_PPV": precision,
+                "DE_TPR": recall,
+                "DE_FDR": fdr,
+                "DE_FNR": fnr,
+                "DE_Accuracy": accuracy,
+                "DE_F1": f1,
+                "DE_TP": tp,
+                "DE_FP": fp,
+                "DE_FN": fn,
+                "DE_TN": tn,
+                "DE_m": total,
+                "DE_R": rejections,
+                "DE_m0": true_nulls,
+            })
+
+            records: list[dict[str, float | str | int]] = []
+            for pert, subset in merged_pd.groupby("pert", sort=False):
+                if pd.isna(pert):
+                    continue
+                subset_tp = int(np.logical_and(subset["pred_significant"], subset["gt_significant"]).sum())
+                subset_fp = int(np.logical_and(subset["pred_significant"], ~subset["gt_significant"]).sum())
+                subset_fn = int(np.logical_and(~subset["pred_significant"], subset["gt_significant"]).sum())
+                subset_tn = int(np.logical_and(~subset["pred_significant"], ~subset["gt_significant"]).sum())
+                subset_total = subset_tp + subset_fp + subset_fn + subset_tn
+                subset_rejections = subset_tp + subset_fp
+                subset_precision = _safe_div(subset_tp, subset_rejections)
+                subset_recall = _safe_div(subset_tp, subset_tp + subset_fn)
+                subset_fdr = _safe_div(subset_fp, subset_rejections)
+                subset_fnr = _safe_div(subset_fn, subset_tp + subset_fn)
+                subset_accuracy = _safe_div(subset_tp + subset_tn, subset_total)
+                subset_f1 = 0.0
+                if subset_rejections and (subset_tp + subset_fn):
+                    denom = subset_precision + subset_recall
+                    if denom:
+                        subset_f1 = 2 * (subset_precision * subset_recall) / denom
+                records.append({
+                    "pert": str(pert),
+                    "TP": subset_tp,
+                    "FP": subset_fp,
+                    "FN": subset_fn,
+                    "TN": subset_tn,
+                    "m": subset_total,
+                    "R": subset_rejections,
+                    "m0": subset_tn + subset_fp,
+                    "PPV": subset_precision,
+                    "TPR": subset_recall,
+                    "FDR": subset_fdr,
+                    "FNR": subset_fnr,
+                    "Accuracy": subset_accuracy,
+                    "F1": subset_f1,
+                })
+
+            if run_dir is not None:
+                metrics_dir = Path(run_dir) / "metrics"
+                metrics_dir.mkdir(parents=True, exist_ok=True)
+
+                de_csv_path = metrics_dir / "de.csv"
+                merged.write_csv(de_csv_path)
+                logger.info("[vcc_eval] Saved DE CSV to %s", de_csv_path)
+
+                overall_path = metrics_dir / "de_confusion_overall.json"
+                by_pert_path = metrics_dir / "de_confusion_by_pert.csv"
+                overall_path.write_text(json.dumps(overall_payload, indent=2))
+                if records:
+                    by_pert_df = pd.DataFrame(records)
+                    by_pert_sorted = by_pert_df.sort_values(["FDR", "TPR"], ascending=[True, False])
+                    by_pert_sorted.to_csv(by_pert_path, index=False)
+                else:
+                    pd.DataFrame(
+                        columns=[
+                            "pert",
+                            "TP",
+                            "FP",
+                            "FN",
+                            "TN",
+                            "m",
+                            "R",
+                            "m0",
+                            "PPV",
+                            "TPR",
+                            "FDR",
+                            "FNR",
+                            "Accuracy",
+                            "F1",
+                        ]
+                    ).to_csv(by_pert_path, index=False)
+                logger.info(
+                    "[vcc_eval] Saved DE confusion summaries to %s and %s",
+                    overall_path,
+                    by_pert_path,
+                )
+        except Exception as exc:  # pragma: no cover - avoid breaking evaluation on export issues
+            logger.warning("[vcc_eval] Failed to export DE CSV: %s", exc)
 
     if save_json and run_dir is not None:
         metrics_path = Path(run_dir) / "metrics" / "metrics.json"

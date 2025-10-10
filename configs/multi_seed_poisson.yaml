@@ -5,7 +5,7 @@
 # 如需修改，请尽量维持结构不变，仅改数值。
 
 experiment:
-  name: "poisson_SCG_GO_embedding"   # 本次实验名（用于输出目录命名）
+  name: "poisson_50_epoch"   # 本次实验名（用于输出目录命名）
   seed: 2025               # 全局随机种子
   device: "auto"           # "auto" | "cpu" | "cuda" | "cuda:0" ...
 
@@ -20,8 +20,8 @@ paths:
   ctrl_h5ad: "./data/adata_ctrl.h5ad" 
 
   # 嵌入（embeddings）
-  gene_embedding_csv: "./data/embeddings/SCG_GOall_concat_Gene_512.csv"
-  pert_embedding_csv: "./data/embeddings/SCG_GOall_concat_Pert_512.csv"
+  gene_embedding_csv: "./data/embeddings/PCA_gene_embedding_512D.csv"
+  pert_embedding_csv: "./data/embeddings/perturbation_embedding_P_512D_cpu.csv"
 
   # 输出根目录（run 子目录将自动生成）
   outputs_root: "./outputs"
@@ -47,7 +47,7 @@ model:
 train:
   fit_mode: "concise"            # ["concise","whole"]；concise=伪批训练（更省显存）
   lr: 5e-4
-  epochs: 100
+  epochs: 50
   batch_size: 2048               # dataloader 基础批大小（内部会做些调整）
 
 size_factor:
@@ -75,6 +75,7 @@ pipeline:
   multi_seed_max_workers: 5            # optional cap on concurrent workers
   persist_intermediate: true           # must stay true so each worker writes outputs
   multi_seed_base_mode: train_sample_eval
+  multi_seed_keep_preds: false          # set false to delete per-seed preds after evaluation
 # pipeline:
 #   mode: "train_sample_eval"      # ["train_sample_eval","train_sample","sample_eval","sample","evaluate_only", "real"]
 #   persist_intermediate: true     # true: 保存 ckpt/pred 文件；false: 采样→评估内存直连

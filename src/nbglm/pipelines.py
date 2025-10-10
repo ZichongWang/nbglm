@@ -119,7 +119,7 @@ def _assign_devices(device_list: List[Optional[str]], count: int) -> List[Option
 
 
 def _format_metrics_markdown(entries: List[Tuple[str, Dict[str, Any]]]) -> str:
-    """Render metrics into a Markdown table with fixed columns."""
+    """Render evaluation results into Markdown sections."""
 
     def _to_float(value: Any) -> Optional[float]:
         if isinstance(value, Number):
@@ -129,44 +129,70 @@ def _format_metrics_markdown(entries: List[Tuple[str, Dict[str, Any]]]) -> str:
         except Exception:
             return None
 
-    def _fmt(value: Optional[float]) -> str:
+    def _fmt_float(value: Optional[float]) -> str:
         return f"{value:.4f}" if value is not None else "-"
 
-    header = "| seed | DES | PDS | MAE | Score |\n| --- | --- | --- | --- | --- |"
+    def _fmt_int(value: Optional[int]) -> str:
+        return str(int(value)) if value is not None else "-"
+
+    def _as_int(metrics: Dict[str, Any], key: str) -> Optional[int]:
+        value = metrics.get(key)
+        if value is None:
+            return None
+        try:
+            return int(round(float(value)))
+        except Exception:
+            return None
+
+    def _safe_ratio(num: Optional[int], den: Optional[int]) -> Optional[float]:
+        if num is None or den is None or den == 0:
+            return None
+        return float(num) / float(den)
+
+    primary_specs = [
+        ("DES", "DES"),
+        ("PDS", "PDS"),
+        ("MAE", "MAE"),
+        ("Score", "Score"),
+    ]
+
+    header = "| seed | " + " | ".join(label for label, _ in primary_specs) + " |"
+    separator = "| " + " | ".join(["---"] * (len(primary_specs) + 1)) + " |"
     rows: List[str] = []
-    des_values, pds_values, mae_values, score_values = [], [], [], []
+    collected: Dict[str, List[float]] = {key: [] for _, key in primary_specs}
 
     for seed_label, metrics in entries:
-        metrics = metrics or {}
-        des = _to_float(metrics.get("DES"))
-        pds = _to_float(metrics.get("PDS"))
-        mae = _to_float(metrics.get("MAE"))
-        score = _to_float(metrics.get("Score")) or _to_float(metrics.get("Overall"))
-        if score is None and None not in (des, pds, mae):
-            # Attempt to compute when possible using legacy baselines
-            des_base, pds_base, mae_base = 0.0761, 0.52, 0.0269
-            try:
-                des_scaled = max(0.0, min(1.0, ((des - des_base) / (1 - des_base)))) if des is not None else None
-                pds_scaled = max(0.0, min(1.0, ((pds - pds_base) / (1 - pds_base)))) if pds is not None else None
-                mae_scaled = max(0.0, min(1.0, ((mae_base - mae) / mae_base))) if mae is not None else None
-                if None not in (des_scaled, pds_scaled, mae_scaled):
-                    score = 100.0 * (des_scaled + pds_scaled + mae_scaled) / 3.0
-            except Exception:
-                score = None
+        metrics = dict(metrics or {})
+        if "Score" not in metrics:
+            score_val = metrics.get("Score") or metrics.get("Overall")
+            if score_val is None:
+                des = _to_float(metrics.get("DES"))
+                pds = _to_float(metrics.get("PDS"))
+                mae = _to_float(metrics.get("MAE"))
+                if None not in (des, pds, mae):
+                    des_base, pds_base, mae_base = 0.0761, 0.52, 0.0269
+                    try:
+                        des_scaled = max(0.0, min(1.0, ((des - des_base) / (1 - des_base)))) if des is not None else None
+                        pds_scaled = max(0.0, min(1.0, ((pds - pds_base) / (1 - pds_base)))) if pds is not None else None
+                        mae_scaled = max(0.0, min(1.0, ((mae_base - mae) / mae_base))) if mae is not None else None
+                        if None not in (des_scaled, pds_scaled, mae_scaled):
+                            score_val = 100.0 * (des_scaled + pds_scaled + mae_scaled) / 3.0
+                    except Exception:
+                        score_val = None
+            if score_val is not None:
+                metrics["Score"] = score_val
 
-        if des is not None:
-            des_values.append(des)
-        if pds is not None:
-            pds_values.append(pds)
-        if mae is not None:
-            mae_values.append(mae)
-        if score is not None:
-            score_values.append(score)
+        row_values = []
+        for _, key in primary_specs:
+            value = metrics.get(key)
+            if key == "Score" and value is None:
+                value = metrics.get("Overall")
+            float_value = _to_float(value)
+            if float_value is not None:
+                collected[key].append(float_value)
+            row_values.append(_fmt_float(float_value))
+        rows.append("| " + " | ".join([seed_label, *row_values]) + " |")
 
-        row = f"| {seed_label} | {_fmt(des)} | {_fmt(pds)} | {_fmt(mae)} | {_fmt(score)} |"
-        rows.append(row)
-
-    # Calculate mean and standard deviation
     def _mean_std(values: List[float]) -> Tuple[Optional[float], Optional[float]]:
         if not values:
             return None, None
@@ -174,16 +200,100 @@ def _format_metrics_markdown(entries: List[Tuple[str, Dict[str, Any]]]) -> str:
         variance = sum((x - mean) ** 2 for x in values) / len(values)
         return mean, variance ** 0.5
 
-    des_mean, des_std = _mean_std(des_values)
-    pds_mean, pds_std = _mean_std(pds_values)
-    mae_mean, mae_std = _mean_std(mae_values)
-    score_mean, score_std = _mean_std(score_values)
+    mean_row = ["Mean"]
+    std_row = ["Std Dev"]
+    for _, key in primary_specs:
+        mean_val, std_val = _mean_std(collected[key])
+        mean_row.append(_fmt_float(mean_val))
+        std_row.append(_fmt_float(std_val))
 
-    # Add mean and standard deviation rows
-    rows.append(f"| Mean | {_fmt(des_mean)} | {_fmt(pds_mean)} | {_fmt(mae_mean)} | {_fmt(score_mean)} |")
-    rows.append(f"| Std Dev | {_fmt(des_std)} | {_fmt(pds_std)} | {_fmt(mae_std)} | {_fmt(score_std)} |")
+    sections: List[str] = []
+    primary_table = "\n".join([header, separator, *rows, "| " + " | ".join(mean_row) + " |", "| " + " | ".join(std_row) + " |"])
+    sections.append("**Primary Metrics**\n" + primary_table)
 
-    return "\n".join([header, *rows])
+    for seed_label, metrics in entries:
+        metrics = dict(metrics or {})
+        tp = _as_int(metrics, "DE_TP")
+        fp = _as_int(metrics, "DE_FP")
+        fn = _as_int(metrics, "DE_FN")
+        tn = _as_int(metrics, "DE_TN")
+
+        if any(value is None for value in (tp, fp, fn, tn)):
+            continue
+
+        total = _as_int(metrics, "DE_m")
+        if total is None and None not in (tp, fp, fn, tn):
+            total = tp + fp + fn + tn
+
+        rejections = _as_int(metrics, "DE_R")
+        if rejections is None and None not in (tp, fp):
+            rejections = tp + fp
+
+        true_nulls = _as_int(metrics, "DE_m0")
+        if true_nulls is None and None not in (tn, fp):
+            true_nulls = tn + fp
+
+        precision = _to_float(metrics.get("DE_PPV"))
+        if precision is None:
+            precision = _safe_ratio(tp, rejections)
+
+        recall = _to_float(metrics.get("DE_TPR"))
+        if recall is None:
+            recall = _safe_ratio(tp, tp + fn if tp is not None and fn is not None else None)
+
+        fdr = _to_float(metrics.get("DE_FDR"))
+        if fdr is None:
+            fdr = _safe_ratio(fp, rejections)
+
+        fnr = _to_float(metrics.get("DE_FNR"))
+        if fnr is None:
+            fnr = _safe_ratio(fn, tp + fn if tp is not None and fn is not None else None)
+
+        accuracy = _to_float(metrics.get("DE_Accuracy"))
+        if accuracy is None and total not in (None, 0):
+            accuracy = _safe_ratio(tp + tn if None not in (tp, tn) else None, total)
+
+        f1 = _to_float(metrics.get("DE_F1"))
+        if f1 is None and precision is not None and recall is not None and (precision + recall) != 0:
+            f1 = 2 * (precision * recall) / (precision + recall)
+
+        confusion_lines = [
+            "| Pred \\ GT | GT: significant | GT: non-significant |",
+            "| --- | --- | --- |",
+            f"| Pred: significant | {_fmt_int(tp)} | {_fmt_int(fp)} |",
+            f"| Pred: non-significant | {_fmt_int(fn)} | {_fmt_int(tn)} |",
+        ]
+
+        summary_lines = [
+            "| Metric | Value |",
+            "| --- | --- |",
+            f"| TP (S) | {_fmt_int(tp)} |",
+            f"| FP (V) | {_fmt_int(fp)} |",
+            f"| FN (T) | {_fmt_int(fn)} |",
+            f"| TN (U) | {_fmt_int(tn)} |",
+            f"| m (total) | {_fmt_int(total)} |",
+            f"| R (rejections) | {_fmt_int(rejections)} |",
+            f"| m0 (true nulls) | {_fmt_int(true_nulls)} |",
+            f"| Precision / PPV | {_fmt_float(precision)} |",
+            f"| Recall / TPR / Power | {_fmt_float(recall)} |",
+            f"| FDR (FDP) | {_fmt_float(fdr)} |",
+            f"| FNR | {_fmt_float(fnr)} |",
+            f"| Accuracy | {_fmt_float(accuracy)} |",
+            f"| F1 | {_fmt_float(f1)} |",
+        ]
+
+        sections.append(
+            "**Seed "
+            + seed_label
+            + " DE Confusion Matrix**\n"
+            + "\n".join(confusion_lines)
+            + "\n\n**Seed "
+            + seed_label
+            + " DE Metrics**\n"
+            + "\n".join(summary_lines)
+        )
+
+    return "\n\n".join(sections)
 
 
 def _prepare_seed_executor_payload(
@@ -641,7 +751,7 @@ def run_sample(
     ad_final.X = ad_final.X.astype(np.float32)
 
     # 落盘 or 内存直连
-    if bool(cfg["pipeline"].get("persist_intermediate", True)):
+    if bool(cfg["pipeline"].get("persist_intermediate", True)) or bool(cfg["pipeline"].get("mode").lower() == "real"):
         out_path = os.path.join(run_dirs["pred_dir"], "pred.h5ad")
         ad_final.write(out_path)
         logger.info("Saving prediction to %s", out_path)
@@ -720,6 +830,8 @@ def run_multi_seed(cfg: dict, run_dirs: Dict[str, str]) -> Dict[str, Any]:
     if not bool(pipeline_cfg.get("persist_intermediate", True)):
         raise ValueError("[pipelines] multi_seed 模式需要 pipeline.persist_intermediate=true 以写盘传递结果")
 
+    keep_preds = bool(pipeline_cfg.get("multi_seed_keep_preds", True))
+
     seeds_cfg = pipeline_cfg.get("seeds")
     if seeds_cfg is None:
         raise ValueError("[pipelines] multi_seed 模式需要提供 pipeline.seeds")
@@ -783,6 +895,27 @@ def run_multi_seed(cfg: dict, run_dirs: Dict[str, str]) -> Dict[str, Any]:
             except Exception as exc:
                 logger.exception("[multi_seed] seed=%d 运行失败", seed_int)
                 raise
+
+            if not keep_preds and "metrics_raw" in result:
+                pred_path = result.pop("pred_adata_path", None)
+                if pred_path:
+                    try:
+                        if os.path.exists(pred_path):
+                            os.remove(pred_path)
+                            logger.info("[multi_seed] Removed prediction file %s", pred_path)
+                    except Exception as remove_exc:  # pragma: no cover - best effort cleanup
+                        logger.warning(
+                            "[multi_seed] Failed to remove prediction file %s: %s",
+                            pred_path,
+                            remove_exc,
+                        )
+                    pred_dir = seed_dirs.get("pred_dir")
+                    if pred_dir and os.path.isdir(pred_dir):
+                        try:
+                            if not os.listdir(pred_dir):
+                                os.rmdir(pred_dir)
+                        except Exception:
+                            pass
 
             metrics_raw = {}
             raw_payload = result.get("metrics_raw")

@@ -75,6 +75,7 @@ pipeline:
   multi_seed_max_workers: 5            # optional cap on concurrent workers
   persist_intermediate: true           # must stay true so each worker writes outputs
   multi_seed_base_mode: train_sample_eval
+  multi_seed_keep_preds: false          # set false to delete per-seed preds after evaluation
 # pipeline:
 #   mode: "train_sample_eval"      # ["train_sample_eval","train_sample","sample_eval","sample","evaluate_only", "real"]
 #   persist_intermediate: true     # true: 保存 ckpt/pred 文件；false: 采样→评估内存直连
