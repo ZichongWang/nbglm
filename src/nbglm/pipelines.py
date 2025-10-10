@@ -32,13 +32,14 @@ import numpy as np
 import pandas as pd
 import anndata as ad
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from . import data_io
 from . import dataset as dset
 from . import model as mdl
 from . import eval as ev
-from .utils import set_seed, json_dump, get_logger
+from .utils import set_seed, json_dump, get_logger, _format_metrics_markdown, _resolve_model_mlp_kwargs
 
 
 logger = logging.getLogger("nbglm.pipelines")
@@ -117,183 +118,6 @@ def _assign_devices(device_list: List[Optional[str]], count: int) -> List[Option
         return [None] * count
     return [normalized[i % len(normalized)] for i in range(count)]
 
-
-def _format_metrics_markdown(entries: List[Tuple[str, Dict[str, Any]]]) -> str:
-    """Render evaluation results into Markdown sections."""
-
-    def _to_float(value: Any) -> Optional[float]:
-        if isinstance(value, Number):
-            return float(value)
-        try:
-            return float(value)
-        except Exception:
-            return None
-
-    def _fmt_float(value: Optional[float]) -> str:
-        return f"{value:.4f}" if value is not None else "-"
-
-    def _fmt_int(value: Optional[int]) -> str:
-        return str(int(value)) if value is not None else "-"
-
-    def _as_int(metrics: Dict[str, Any], key: str) -> Optional[int]:
-        value = metrics.get(key)
-        if value is None:
-            return None
-        try:
-            return int(round(float(value)))
-        except Exception:
-            return None
-
-    def _safe_ratio(num: Optional[int], den: Optional[int]) -> Optional[float]:
-        if num is None or den is None or den == 0:
-            return None
-        return float(num) / float(den)
-
-    primary_specs = [
-        ("DES", "DES"),
-        ("PDS", "PDS"),
-        ("MAE", "MAE"),
-        ("Score", "Score"),
-    ]
-
-    header = "| seed | " + " | ".join(label for label, _ in primary_specs) + " |"
-    separator = "| " + " | ".join(["---"] * (len(primary_specs) + 1)) + " |"
-    rows: List[str] = []
-    collected: Dict[str, List[float]] = {key: [] for _, key in primary_specs}
-
-    for seed_label, metrics in entries:
-        metrics = dict(metrics or {})
-        if "Score" not in metrics:
-            score_val = metrics.get("Score") or metrics.get("Overall")
-            if score_val is None:
-                des = _to_float(metrics.get("DES"))
-                pds = _to_float(metrics.get("PDS"))
-                mae = _to_float(metrics.get("MAE"))
-                if None not in (des, pds, mae):
-                    des_base, pds_base, mae_base = 0.0761, 0.52, 0.0269
-                    try:
-                        des_scaled = max(0.0, min(1.0, ((des - des_base) / (1 - des_base)))) if des is not None else None
-                        pds_scaled = max(0.0, min(1.0, ((pds - pds_base) / (1 - pds_base)))) if pds is not None else None
-                        mae_scaled = max(0.0, min(1.0, ((mae_base - mae) / mae_base))) if mae is not None else None
-                        if None not in (des_scaled, pds_scaled, mae_scaled):
-                            score_val = 100.0 * (des_scaled + pds_scaled + mae_scaled) / 3.0
-                    except Exception:
-                        score_val = None
-            if score_val is not None:
-                metrics["Score"] = score_val
-
-        row_values = []
-        for _, key in primary_specs:
-            value = metrics.get(key)
-            if key == "Score" and value is None:
-                value = metrics.get("Overall")
-            float_value = _to_float(value)
-            if float_value is not None:
-                collected[key].append(float_value)
-            row_values.append(_fmt_float(float_value))
-        rows.append("| " + " | ".join([seed_label, *row_values]) + " |")
-
-    def _mean_std(values: List[float]) -> Tuple[Optional[float], Optional[float]]:
-        if not values:
-            return None, None
-        mean = sum(values) / len(values)
-        variance = sum((x - mean) ** 2 for x in values) / len(values)
-        return mean, variance ** 0.5
-
-    mean_row = ["Mean"]
-    std_row = ["Std Dev"]
-    for _, key in primary_specs:
-        mean_val, std_val = _mean_std(collected[key])
-        mean_row.append(_fmt_float(mean_val))
-        std_row.append(_fmt_float(std_val))
-
-    sections: List[str] = []
-    primary_table = "\n".join([header, separator, *rows, "| " + " | ".join(mean_row) + " |", "| " + " | ".join(std_row) + " |"])
-    sections.append("**Primary Metrics**\n" + primary_table)
-
-    for seed_label, metrics in entries:
-        metrics = dict(metrics or {})
-        tp = _as_int(metrics, "DE_TP")
-        fp = _as_int(metrics, "DE_FP")
-        fn = _as_int(metrics, "DE_FN")
-        tn = _as_int(metrics, "DE_TN")
-
-        if any(value is None for value in (tp, fp, fn, tn)):
-            continue
-
-        total = _as_int(metrics, "DE_m")
-        if total is None and None not in (tp, fp, fn, tn):
-            total = tp + fp + fn + tn
-
-        rejections = _as_int(metrics, "DE_R")
-        if rejections is None and None not in (tp, fp):
-            rejections = tp + fp
-
-        true_nulls = _as_int(metrics, "DE_m0")
-        if true_nulls is None and None not in (tn, fp):
-            true_nulls = tn + fp
-
-        precision = _to_float(metrics.get("DE_PPV"))
-        if precision is None:
-            precision = _safe_ratio(tp, rejections)
-
-        recall = _to_float(metrics.get("DE_TPR"))
-        if recall is None:
-            recall = _safe_ratio(tp, tp + fn if tp is not None and fn is not None else None)
-
-        fdr = _to_float(metrics.get("DE_FDR"))
-        if fdr is None:
-            fdr = _safe_ratio(fp, rejections)
-
-        fnr = _to_float(metrics.get("DE_FNR"))
-        if fnr is None:
-            fnr = _safe_ratio(fn, tp + fn if tp is not None and fn is not None else None)
-
-        accuracy = _to_float(metrics.get("DE_Accuracy"))
-        if accuracy is None and total not in (None, 0):
-            accuracy = _safe_ratio(tp + tn if None not in (tp, tn) else None, total)
-
-        f1 = _to_float(metrics.get("DE_F1"))
-        if f1 is None and precision is not None and recall is not None and (precision + recall) != 0:
-            f1 = 2 * (precision * recall) / (precision + recall)
-
-        confusion_lines = [
-            "| Pred \\ GT | GT: significant | GT: non-significant |",
-            "| --- | --- | --- |",
-            f"| Pred: significant | {_fmt_int(tp)} | {_fmt_int(fp)} |",
-            f"| Pred: non-significant | {_fmt_int(fn)} | {_fmt_int(tn)} |",
-        ]
-
-        summary_lines = [
-            "| Metric | Value |",
-            "| --- | --- |",
-            f"| TP (S) | {_fmt_int(tp)} |",
-            f"| FP (V) | {_fmt_int(fp)} |",
-            f"| FN (T) | {_fmt_int(fn)} |",
-            f"| TN (U) | {_fmt_int(tn)} |",
-            f"| m (total) | {_fmt_int(total)} |",
-            f"| R (rejections) | {_fmt_int(rejections)} |",
-            f"| m0 (true nulls) | {_fmt_int(true_nulls)} |",
-            f"| Precision / PPV | {_fmt_float(precision)} |",
-            f"| Recall / TPR / Power | {_fmt_float(recall)} |",
-            f"| FDR (FDP) | {_fmt_float(fdr)} |",
-            f"| FNR | {_fmt_float(fnr)} |",
-            f"| Accuracy | {_fmt_float(accuracy)} |",
-            f"| F1 | {_fmt_float(f1)} |",
-        ]
-
-        sections.append(
-            "**Seed "
-            + seed_label
-            + " DE Confusion Matrix**\n"
-            + "\n".join(confusion_lines)
-            + "\n\n**Seed "
-            + seed_label
-            + " DE Metrics**\n"
-            + "\n".join(summary_lines)
-        )
-
-    return "\n\n".join(sections)
 
 
 def _prepare_seed_executor_payload(
@@ -497,12 +321,14 @@ def _build_training_dataloader(cfg: dict, adata_all: ad.AnnData, adata_pert: ad.
 
 def _instantiate_model(cfg: dict, G: torch.Tensor, P: torch.Tensor, mu_control: torch.Tensor, theta_vec: torch.Tensor) -> mdl.LowRankNB_GLM:
     use_cycle = bool(cfg.get("model", {}).get("use_cycle", False))
+    mlp_kwargs = _resolve_model_mlp_kwargs(cfg.get("model", {}))
     net = mdl.LowRankNB_GLM(
         gene_emb=G,
         pert_emb=P,
         mu_control=mu_control,
         theta_per_gene=theta_vec,
         use_cycle=use_cycle,
+        **mlp_kwargs,
     )
     return net
 
@@ -542,7 +368,17 @@ def run_train(cfg: dict, run_dirs: Dict[str, str]) -> Dict[str, Any]:
 
     # 模型与训练
     model = _instantiate_model(cfg, G, P, meta["mu_control"], meta["theta_vec"])
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"Total params: {total:,} | Trainable: {trainable:,}")
+    print(model)
+
     loss_name = cfg["model"]["losses"]["primary"]
+    sched_cfg = cfg.get("train", {}).get("lr_schedule", {})
+    use_lr_schedule = bool(sched_cfg.get("enabled", True))
+    lr_schedule_type = str(sched_cfg.get("type", "cosine"))
+    lr_warmup_pct = float(sched_cfg.get("warmup_pct", 0.05))
+    lr_min = float(sched_cfg.get("min_lr", 1e-5))
     model.fit(
         dataloader=loader,
         loss_type=loss_name,
@@ -551,6 +387,10 @@ def run_train(cfg: dict, run_dirs: Dict[str, str]) -> Dict[str, Any]:
         l1_lambda=float(cfg["model"]["regularization"].get("l1", 1e-4)),
         l2_lambda=float(cfg["model"]["regularization"].get("l2", 5e-3)),
         progress=True,
+        use_lr_schedule=use_lr_schedule,
+        lr_schedule_type=lr_schedule_type,
+        lr_warmup_pct=lr_warmup_pct,
+        lr_min=lr_min,
     )
 
     # 可选：保存 ckpt（包含必要常量，保证采样期无需再读 embeddings）
@@ -596,12 +436,15 @@ def run_train(cfg: dict, run_dirs: Dict[str, str]) -> Dict[str, Any]:
 # -----------------------------
 def _load_model_from_ckpt(ckpt_path: str) -> mdl.LowRankNB_GLM:
     ckpt = torch.load(ckpt_path, map_location="cpu")
+    saved_cfg = ckpt.get("cfg", {}) if isinstance(ckpt, dict) else {}
+    mlp_kwargs = _resolve_model_mlp_kwargs(saved_cfg.get("model", {}) if isinstance(saved_cfg, dict) else {})
     net = mdl.LowRankNB_GLM(
         gene_emb=ckpt["G"],
         pert_emb=ckpt["P"],
         mu_control=ckpt["mu_control"],
         theta_per_gene=ckpt["theta_vec"],
         use_cycle=bool(ckpt.get("use_cycle", False)),
+        **mlp_kwargs,
     )
     net.load_state_dict(ckpt["state_dict"])
     return net

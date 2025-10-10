@@ -136,11 +136,30 @@ Outputs will be placed under `outputs/{experiment_name}__{timestamp}`/ with:
    - Set `experiment.seed` in addition to `pipeline.seeds` if downstream logic uses a global seed.
    - Make sure GPU indices match the device ordering from `nvidia-smi`; strings like `"cuda:2"` are normalized to `2`, while `"cpu"`/`-1` forces a CPU run.
 
-+ To switch **whole-cell** vs **pseudo-bulk** training:
-   + `train.fit_mode: whole | concise`
+## MLP Hyperparameters for Embeddings
 
-+ To use cell cycle covariate:
-   + `model.use_cycle: true` and ensure `data.phase_column` exists.
+The `LowRankNB_GLM` can process gene (`G`) and perturbation (`P`) embeddings through configurable MLP stacks before applying the low-rank kernel. Configure them in your YAML under `model`:
+
+```yaml
+model:
+  g_mlp_hidden: [384]   # hidden widths for the gene-side MLP ([] = identity)
+  g_out_dim: 192        # optional final dimension for processed gene embeddings
+  p_mlp_hidden: [384]   # hidden widths for the perturbation-side MLP
+  p_out_dim: 192        # optional final dimension for processed perturbations
+  gp_activation: "gelu" # activation name (relu/gelu/silu/tanh/identity)
+  gp_norm: "layernorm"  # normalization per hidden layer: none|batchnorm|layernorm
+  gp_dropout: 0.1       # dropout applied after each hidden layer (0-1)
+```
+
+Pipelines parse these fields automatically: training builds the MLPs via `build_mlp` and stores the configuration inside the checkpoint; sampling/evaluation rebuild the same architecture when the checkpoint is loaded. Override the defaults per experiment to explore deeper stacks or alternative activations without code edits.
+
+## Whole-cell vs Pseudo-bulk
+
+- `train.fit_mode: whole | concise`
+
+## Cell Cycle Covariate
+
+- Enable with `model.use_cycle: true` and ensure `data.phase_column` exists in the AnnData `obs`.
 
 
 ## Notes

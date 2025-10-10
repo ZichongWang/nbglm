@@ -58,7 +58,9 @@ import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
-
+from typing import List, Optional, Literal
+from torch.optim.lr_scheduler import LambdaLR
+from .utils import build_mlp
 
 # -----------------------------
 # 损失函数集合（Registry）
@@ -150,6 +152,19 @@ class LowRankNB_GLM(nn.Module):
     use_cycle : bool
         是否在 log-mean 中加入细胞周期（S/G2M）固定效应，G1 为基线。
 
+    g_mlp_hidden : List[int]
+        作用在 G 上的 MLP 隐藏层，如 [256]；[] 表示不用（identity）。
+    p_mlp_hidden : List[int]
+        作用在 P 上的 MLP 隐藏层，如 [256]；[] 表示不用（identity）。
+    g_out_dim / p_out_dim : Optional[int]
+        若需要把 G/P 最终映射到指定维度，填这里；默认不改变维度。
+    gp_activation : nn.Module
+        预处理 MLP 的激活函数（activation），默认 ReLU。
+    gp_dropout : float
+        预处理 MLP 的 dropout 概率。
+    gp_norm : {"none","batchnorm","layernorm"}
+        预处理 MLP 的归一化类型。
+
     Attributes
     ----------
     K : nn.Parameter
@@ -169,25 +184,43 @@ class LowRankNB_GLM(nn.Module):
         pert_emb: torch.Tensor,
         mu_control: torch.Tensor,
         theta_per_gene: torch.Tensor,
-        use_cycle: bool = False
+        use_cycle: bool = False,
+        *,
+        g_mlp_hidden: List[int] = [],
+        p_mlp_hidden: List[int] = [],
+        g_out_dim: Optional[int] = None,
+        p_out_dim: Optional[int] = None,
+        gp_activation: Optional[nn.Module] = None,
+        gp_dropout: float = 0.0,
+        gp_norm: Literal["none", "batchnorm", "layernorm"] = "none",
     ):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # 缓存常量到 device
-        self.G = gene_emb.to(self.device)                # [n_g, d_g]
-        self.P = pert_emb.to(self.device)                # [n_p, d_p]
-        self.mu_control = (mu_control + 1e-8).to(self.device)  # 避免 log(0)
-        self.theta = theta_per_gene.to(self.device)      # [n_g]
         self.use_cycle = use_cycle
+        self.register_buffer("G", gene_emb.to(self.device))
+        self.register_buffer("P", pert_emb.to(self.device))
+        self.register_buffer("mu_control", (mu_control + 1e-8).to(self.device))  # 避免 log(0)
+        self.register_buffer("theta", theta_per_gene.to(self.device))
 
         n_genes, d_g = self.G.shape
         _, d_p = self.P.shape
 
+        self.g_mlp, d_g_out = build_mlp(
+            in_dim=d_g, hidden_dims=g_mlp_hidden, out_dim=g_out_dim,
+            activation=gp_activation, dropout=gp_dropout, norm=gp_norm
+        )
+        self.p_mlp, d_p_out = build_mlp(
+            in_dim=d_p, hidden_dims=p_mlp_hidden, out_dim=p_out_dim,
+            activation=gp_activation, dropout=gp_dropout, norm=gp_norm
+        )
+        self.g_mlp.to(self.device)
+        self.p_mlp.to(self.device)
+
         # 可学习参数
-        self.K = nn.Parameter(torch.empty(d_g, d_p, device=self.device))
+        self.K = nn.Parameter(torch.empty(d_g_out, d_p_out, device=self.device))
         self.bias = nn.Parameter(torch.empty(n_genes, device=self.device))
-        self.delta_log_mu_scaler = nn.Parameter(torch.tensor(5.0, device=self.device))
+        self.delta_log_mu_scaler = nn.Parameter(torch.tensor(2.5, device=self.device))
         if self.use_cycle:
             self.beta_cycle = nn.Parameter(torch.zeros(n_genes, 2, device=self.device))  # (S, G2M)
         else:
@@ -232,8 +265,10 @@ class LowRankNB_GLM(nn.Module):
             [B, n_g] 的观测尺度均值（已 clamp 到 [1e-10, 1e7]）。
         """
         # 选择扰动嵌入并计算低秩项
-        P_sel = self.P[pert_ids]  # [B, d_p]
-        raw = (self.G @ self.K @ P_sel.T).T + self.bias.unsqueeze(0)  # [B, n_g]
+        G_t = self.g_mlp(self.G)                       # [n_g, d_g']
+        P_sel = self.P[pert_ids]                       # [B, d_p]
+        P_t = self.p_mlp(P_sel)                        # [B, d_p']
+        raw = (G_t @ self.K @ P_t.T).T + self.bias.unsqueeze(0)  # [B, n_g]
         delta_log_mu = self.delta_log_mu_scaler * torch.tanh(raw)     # [B, n_g]
 
         # 周期项
@@ -263,7 +298,12 @@ class LowRankNB_GLM(nn.Module):
         n_epochs: int = 100,
         l1_lambda: float = 1e-4,
         l2_lambda: float = 5e-3,
-        progress: bool = True
+        progress: bool = True,
+        *,
+        use_lr_schedule: bool = True,
+        lr_schedule_type: str = "cosine",
+        lr_warmup_pct: float = 0.05,
+        lr_min: float = 1e-5,
     ) -> None:
         """
         统一训练循环（Unified training loop）。
@@ -283,6 +323,26 @@ class LowRankNB_GLM(nn.Module):
         """
         loss_type = loss_type.upper()
         optimizer = optim.AdamW(self.parameters(), lr=learning_rate)
+
+        # Optional learning-rate scheduler: linear warmup then cosine decay to lr_min.
+        scheduler = None
+        if use_lr_schedule and n_epochs > 0:
+            warmup_steps = int(max(0, round(n_epochs * max(0.0, min(1.0, lr_warmup_pct)))))
+            lr_floor_ratio = max(0.0, min(1.0, lr_min / max(learning_rate, 1e-12)))
+
+            def _lr_lambda(epoch: int) -> float:
+                if lr_schedule_type.lower() != "cosine":
+                    return 1.0
+                if warmup_steps > 0 and epoch < warmup_steps:
+                    return float(epoch + 1) / float(max(1, warmup_steps))
+                if n_epochs <= warmup_steps:
+                    return 1.0
+                t = (epoch - warmup_steps) / float(max(1, n_epochs - warmup_steps))
+                t = max(0.0, min(1.0, t))
+                cos = 0.5 * (1.0 + math.cos(math.pi * t))
+                return lr_floor_ratio + (1.0 - lr_floor_ratio) * cos
+
+            scheduler = LambdaLR(optimizer, lr_lambda=_lr_lambda)
         logger.info(f"[LowRankNB_GLM.fit] Start training with loss: {loss_type}. Device: {self.device}")
 
         def loss_nb_nll(mu: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -324,7 +384,7 @@ class LowRankNB_GLM(nn.Module):
             except Exception:
                 pass
 
-        for _ in loop:
+        for epoch_idx in loop:
             epoch_loss = 0.0
             total_n = 0
             for batch in dataloader:
@@ -358,7 +418,14 @@ class LowRankNB_GLM(nn.Module):
             if progress and total_n > 0:
                 avg_loss = epoch_loss / total_n
                 try:
-                    loop.set_postfix(loss=f"{avg_loss:.4f}")
+                    cur_lr = optimizer.param_groups[0]["lr"]
+                    loop.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{cur_lr:.2e}")
+                except Exception:
+                    pass
+
+            if scheduler is not None:
+                try:
+                    scheduler.step()
                 except Exception:
                     pass
 

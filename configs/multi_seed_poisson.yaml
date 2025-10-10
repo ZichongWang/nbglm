@@ -43,12 +43,24 @@ model:
   regularization:
     l1: 0
     l2: 0
+  g_mlp_hidden: [384]
+  g_out_dim: 192
+  p_mlp_hidden: [384]
+  p_out_dim: 192
+  gp_activation: "gelu"
+  gp_norm: "layernorm"
+  gp_dropout: 0.1
 
 train:
   fit_mode: "concise"            # ["concise","whole"]；concise=伪批训练（更省显存）
   lr: 5e-4
   epochs: 50
   batch_size: 2048               # dataloader 基础批大小（内部会做些调整）
+  lr_schedule:
+    enabled: true
+    type: cosine
+    warmup_pct: 0.05
+    min_lr: 1e-5
 
 size_factor:
   use_sf: true                   # 是否在训练与采样使用 size factor 作为 offset（log_s）
